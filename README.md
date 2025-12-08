@@ -94,6 +94,35 @@ Benefits of cached training:
 - **Larger batch sizes** possible (64+ instead of 32)
 - Can train on smaller GPUs or even CPU
 
+### Weights & Biases Logging
+
+Training automatically logs to [Weights & Biases](https://wandb.ai) if installed:
+
+```bash
+# Install wandb
+pip install wandb
+
+# Login (one-time)
+wandb login
+
+# Train with logging
+python train_cached.py --wandb --wandb-project my-project --wandb-run-name experiment-1
+
+# Disable logging
+python train_cached.py --no-wandb
+```
+
+**Logged Metrics:**
+
+| Category | Metrics |
+|----------|---------|
+| **Training** | `loss`, `lr`, `grad_norm`, `samples_per_sec`, `epoch_time` |
+| **Validation** | `loss`, `iou_mean`, `iou_median`, `giou_mean`, `center_dist_mean`, `acc@0.3/0.5/0.7` |
+| **Best** | `best_iou` (tracked across epochs) |
+| **Model** | Parameter counts per component |
+
+Best models are also saved as wandb artifacts for easy versioning.
+
 ### Configuration
 
 Edit `config/model.yaml` for model architecture:

@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -32,16 +33,16 @@ from models.trm_core import TRMController
 from models.bbox_head import BBoxHead
 from utils import BBoxLoss, EMAHelper, compute_metrics
 
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 def get_device(requested: str = "auto") -> torch.device:
-    """Get the best available device.
-    
-    Args:
-        requested: Device string ("auto", "cuda", "mps", "cpu")
-        
-    Returns:
-        torch.device for the selected device
-    """
+    """Get the best available device."""
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -74,7 +75,7 @@ class TrainConfig:
     val_split: float = 0.1
     
     # Training
-    batch_size: int = 64  # Can be larger since no CLIP overhead
+    batch_size: int = 64
     epochs: int = 50
     lr: float = 1e-4
     weight_decay: float = 0.01
@@ -106,8 +107,14 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints/"
     save_best: bool = True
     
+    # Wandb
+    use_wandb: bool = True
+    wandb_project: str = "screenspot-trm"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    
     # Device
-    device: str = "auto"  # auto, cuda, mps, cpu
+    device: str = "auto"
     num_workers: int = 4
     
     # Reproducibility
@@ -125,16 +132,13 @@ class CachedEmbeddingDataset(Dataset):
         val_split: float = 0.1,
         seed: int = 42,
     ):
-        # Load parquet for bboxes
         self.df = pd.read_parquet(parquet_path)
         
-        # Load embeddings
         data = torch.load(embeddings_path)
         self.img_embeddings = data["img_embeddings"]
         self.txt_embeddings = data["txt_embeddings"]
         self.embed_dim = data["embed_dim"]
         
-        # Create split
         n = len(self.df)
         indices = list(range(n))
         
@@ -283,16 +287,21 @@ def evaluate(model, dataloader, criterion, device):
 def train_epoch(
     model, dataloader, optimizer, criterion, device,
     config, epoch, global_step, total_steps, ema=None,
+    use_wandb=False,
 ):
     model.train()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     running_loss = 0.0
+    epoch_start_time = time.time()
+    batch_start_time = time.time()
+    samples_processed = 0
     
     for batch_idx, batch in enumerate(pbar):
         img_embs = batch["img_embs"].to(device)
         txt_embs = batch["txt_embs"].to(device)
         bboxes = batch["bboxes"].to(device)
+        batch_size = len(img_embs)
         
         lr = cosine_schedule_with_warmup(
             global_step, total_steps, config.warmup_steps, config.lr
@@ -310,7 +319,9 @@ def train_epoch(
         loss.backward()
         
         if config.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        else:
+            grad_norm = 0.0
         
         optimizer.step()
         
@@ -318,11 +329,43 @@ def train_epoch(
             ema.update(model)
         
         running_loss += loss.item()
+        samples_processed += batch_size
         global_step += 1
         
+        # Logging
         if batch_idx % config.log_interval == 0:
             avg_loss = running_loss / (batch_idx + 1)
-            pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{lr:.2e}"})
+            elapsed = time.time() - batch_start_time
+            samples_per_sec = samples_processed / elapsed if elapsed > 0 else 0
+            
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "lr": f"{lr:.2e}",
+                "samples/s": f"{samples_per_sec:.1f}"
+            })
+            
+            # Log to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/loss_avg": avg_loss,
+                    "train/lr": lr,
+                    "train/grad_norm": grad_norm if isinstance(grad_norm, float) else grad_norm.item(),
+                    "train/samples_per_sec": samples_per_sec,
+                    "train/epoch": epoch,
+                    "train/step": global_step,
+                }, step=global_step)
+    
+    # Log epoch summary
+    epoch_time = time.time() - epoch_start_time
+    epoch_loss = running_loss / len(dataloader)
+    
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.log({
+            "train/epoch_loss": epoch_loss,
+            "train/epoch_time_sec": epoch_time,
+            "train/epoch": epoch,
+        }, step=global_step)
     
     return global_step
 
@@ -335,22 +378,40 @@ def train(config: TrainConfig):
     device = get_device(config.device)
     print(f"Using device: {device}")
     
-    # Load embeddings to get clip_dim
+    # Initialize wandb
+    use_wandb = config.use_wandb and WANDB_AVAILABLE
+    if config.use_wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb not installed, logging disabled. Install with: pip install wandb")
+    
+    if use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.wandb_run_name,
+            config=asdict(config),
+            tags=["screenspot", "trm", "bbox", "cached"],
+        )
+    
+    # Load embeddings
     print(f"Loading embeddings: {config.embeddings_path}")
     emb_data = torch.load(config.embeddings_path)
     clip_dim = emb_data["embed_dim"]
     print(f"  CLIP dim: {clip_dim}")
     print(f"  Samples: {emb_data['n_samples']}")
     
-    # Create model (without CLIP)
+    # Create model
     print("Creating TRM model (no CLIP)...")
     model = TRMOnlyModel(config, clip_dim=clip_dim)
     model = model.to(device)
     
+    # Log parameter counts
     param_counts = model.count_parameters()
     print(f"Model parameters:")
     for k, v in param_counts.items():
         print(f"  {k}: {v:,}")
+    
+    if use_wandb:
+        wandb.log({"model/params_" + k: v for k, v in param_counts.items()}, step=0)
     
     # Create datasets
     print("Loading cached datasets...")
@@ -371,6 +432,13 @@ def train(config: TrainConfig):
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
+    
+    if use_wandb:
+        wandb.log({
+            "data/train_samples": len(train_dataset),
+            "data/val_samples": len(val_dataset),
+            "data/clip_dim": clip_dim,
+        }, step=0)
     
     train_loader = DataLoader(
         train_dataset,
@@ -425,7 +493,8 @@ def train(config: TrainConfig):
         
         global_step = train_epoch(
             model, train_loader, optimizer, criterion, device,
-            config, epoch + 1, global_step, total_steps, ema
+            config, epoch + 1, global_step, total_steps, ema,
+            use_wandb=use_wandb,
         )
         
         if (epoch + 1) % config.eval_interval == 0:
@@ -438,8 +507,16 @@ def train(config: TrainConfig):
             for k, v in metrics.items():
                 print(f"  {k}: {v:.4f}")
             
+            # Log to wandb
+            if use_wandb:
+                val_metrics = {f"val/{k}": v for k, v in metrics.items()}
+                val_metrics["val/best_iou"] = max(best_iou, metrics["iou_mean"])
+                val_metrics["val/epoch"] = epoch + 1
+                wandb.log(val_metrics, step=global_step)
+            
             if config.save_best and metrics["iou_mean"] > best_iou:
                 best_iou = metrics["iou_mean"]
+                save_path = checkpoint_dir / "best_model.pt"
                 torch.save({
                     "epoch": epoch + 1,
                     "model_state_dict": eval_model.state_dict(),
@@ -447,8 +524,18 @@ def train(config: TrainConfig):
                     "metrics": metrics,
                     "config": asdict(config),
                     "clip_dim": clip_dim,
-                }, checkpoint_dir / "best_model.pt")
+                }, save_path)
                 print(f"Saved best model (IoU: {best_iou:.4f})")
+                
+                # Log model artifact
+                if use_wandb:
+                    artifact = wandb.Artifact(
+                        name=f"best-model-{wandb.run.id}",
+                        type="model",
+                        metadata={"iou_mean": best_iou, "epoch": epoch + 1}
+                    )
+                    artifact.add_file(str(save_path))
+                    wandb.log_artifact(artifact)
             
             if ema:
                 del eval_model
@@ -460,6 +547,14 @@ def train(config: TrainConfig):
         "config": asdict(config),
         "clip_dim": clip_dim,
     }, checkpoint_dir / "final_model.pt")
+    
+    # Log final summary
+    if use_wandb:
+        wandb.log({
+            "final/best_iou": best_iou,
+            "final/epochs_trained": config.epochs,
+        }, step=global_step)
+        wandb.finish()
     
     print(f"\nTraining complete!")
     print(f"Best validation IoU: {best_iou:.4f}")
@@ -476,6 +571,12 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--config", type=str, default=None, help="YAML config file")
+    
+    # Wandb options
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     
     args = parser.parse_args()
     
@@ -502,6 +603,16 @@ def main():
         config.checkpoint_dir = args.checkpoint_dir
     if args.device:
         config.device = args.device
+    
+    # Wandb overrides
+    if args.wandb:
+        config.use_wandb = True
+    if args.no_wandb:
+        config.use_wandb = False
+    if args.wandb_project:
+        config.wandb_project = args.wandb_project
+    if args.wandb_run_name:
+        config.wandb_run_name = args.wandb_run_name
     
     train(config)
 

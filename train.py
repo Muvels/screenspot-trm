@@ -1,9 +1,9 @@
 """Training script for ScreenSpot TRM bounding box model."""
 
 import argparse
-import json
 import math
 import os
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -20,16 +20,16 @@ from models.screen_trm_model import ModelConfig
 from data import ScreenSpotDataset, collate_fn
 from utils import BBoxLoss, EMAHelper, compute_metrics
 
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 def get_device(requested: str = "auto") -> torch.device:
-    """Get the best available device.
-    
-    Args:
-        requested: Device string ("auto", "cuda", "mps", "cpu")
-        
-    Returns:
-        torch.device for the selected device
-    """
+    """Get the best available device."""
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -83,8 +83,14 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints/"
     save_best: bool = True
     
+    # Wandb
+    use_wandb: bool = True
+    wandb_project: str = "screenspot-trm"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    
     # Device
-    device: str = "auto"  # auto, cuda, mps, cpu
+    device: str = "auto"
     num_workers: int = 4
     
     # Reproducibility
@@ -98,23 +104,10 @@ def cosine_schedule_with_warmup(
     base_lr: float,
     min_lr_ratio: float = 0.1,
 ) -> float:
-    """Compute learning rate with cosine decay and linear warmup.
-    
-    Args:
-        step: Current step
-        total_steps: Total training steps
-        warmup_steps: Number of warmup steps
-        base_lr: Base learning rate
-        min_lr_ratio: Minimum LR as fraction of base
-        
-    Returns:
-        Learning rate for current step
-    """
+    """Compute learning rate with cosine decay and linear warmup."""
     if step < warmup_steps:
-        # Linear warmup
         return base_lr * step / max(warmup_steps, 1)
     else:
-        # Cosine decay
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
         return base_lr * (min_lr_ratio + (1 - min_lr_ratio) * cosine_decay)
@@ -133,17 +126,7 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Evaluate model on validation set.
-    
-    Args:
-        model: Model to evaluate
-        dataloader: Validation dataloader
-        criterion: Loss function
-        device: Device to use
-        
-    Returns:
-        Dictionary of metric names to values
-    """
+    """Evaluate model on validation set."""
     model.eval()
     
     total_loss = 0.0
@@ -157,23 +140,18 @@ def evaluate(
         bboxes = batch["bboxes"].to(device)
         image_sizes = batch["image_sizes"]
         
-        # Forward
         pred_bbox, _ = model(images, tasks, return_intermediates=False)
         
-        # Loss
         loss = criterion(pred_bbox, bboxes)
         total_loss += loss.item() * len(images)
         
-        # Collect predictions
         all_preds.append(pred_bbox.cpu())
         all_targets.append(bboxes.cpu())
         all_image_sizes.extend(image_sizes)
     
-    # Aggregate
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
-    # Compute metrics
     metrics = compute_metrics(all_preds, all_targets, all_image_sizes)
     metrics["loss"] = total_loss / len(dataloader.dataset)
     
@@ -191,83 +169,94 @@ def train_epoch(
     global_step: int,
     total_steps: int,
     ema: Optional[EMAHelper] = None,
+    use_wandb: bool = False,
 ) -> int:
-    """Train for one epoch.
-    
-    Args:
-        model: Model to train
-        dataloader: Training dataloader
-        optimizer: Optimizer
-        criterion: Loss function
-        device: Device to use
-        config: Training config
-        epoch: Current epoch number
-        global_step: Current global step
-        total_steps: Total training steps
-        ema: Optional EMA helper
-        
-    Returns:
-        Updated global step
-    """
+    """Train for one epoch."""
     model.train()
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     running_loss = 0.0
+    epoch_start_time = time.time()
+    batch_start_time = time.time()
+    samples_processed = 0
     
     for batch_idx, batch in enumerate(pbar):
         images = batch["images"].to(device)
         tasks = batch["tasks"]
         bboxes = batch["bboxes"].to(device)
+        batch_size = len(images)
         
-        # Update learning rate
         lr = cosine_schedule_with_warmup(
             global_step, total_steps, config.warmup_steps, config.lr
         )
         set_lr(optimizer, lr)
         
-        # Forward
         pred_bbox, intermediates = model(
             images, tasks,
             return_intermediates=config.deep_supervision
         )
         
-        # Loss
         loss = criterion(pred_bbox, bboxes, intermediates)
         
-        # Backward
         optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping
         if config.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip
             )
+        else:
+            grad_norm = 0.0
         
         optimizer.step()
         
-        # EMA update
         if ema is not None:
             ema.update(model)
         
-        # Logging
         running_loss += loss.item()
+        samples_processed += batch_size
         global_step += 1
         
+        # Logging
         if batch_idx % config.log_interval == 0:
             avg_loss = running_loss / (batch_idx + 1)
-            pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{lr:.2e}"})
+            elapsed = time.time() - batch_start_time
+            samples_per_sec = samples_processed / elapsed if elapsed > 0 else 0
+            
+            pbar.set_postfix({
+                "loss": f"{avg_loss:.4f}",
+                "lr": f"{lr:.2e}",
+                "samples/s": f"{samples_per_sec:.1f}"
+            })
+            
+            # Log to wandb
+            if use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/loss_avg": avg_loss,
+                    "train/lr": lr,
+                    "train/grad_norm": grad_norm if isinstance(grad_norm, float) else grad_norm.item(),
+                    "train/samples_per_sec": samples_per_sec,
+                    "train/epoch": epoch,
+                    "train/step": global_step,
+                }, step=global_step)
+    
+    # Log epoch summary
+    epoch_time = time.time() - epoch_start_time
+    epoch_loss = running_loss / len(dataloader)
+    
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.log({
+            "train/epoch_loss": epoch_loss,
+            "train/epoch_time_sec": epoch_time,
+            "train/epoch": epoch,
+        }, step=global_step)
     
     return global_step
 
 
 def train(config: TrainConfig, model_config: ModelConfig) -> None:
-    """Main training function.
-    
-    Args:
-        config: Training configuration
-        model_config: Model configuration
-    """
+    """Main training function."""
     # Set seed
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
@@ -277,16 +266,36 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
     device = get_device(config.device)
     print(f"Using device: {device}")
     
+    # Initialize wandb
+    use_wandb = config.use_wandb and WANDB_AVAILABLE
+    if config.use_wandb and not WANDB_AVAILABLE:
+        print("Warning: wandb not installed, logging disabled. Install with: pip install wandb")
+    
+    if use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.wandb_run_name,
+            config={
+                "train": asdict(config),
+                "model": asdict(model_config),
+            },
+            tags=["screenspot", "trm", "bbox"],
+        )
+    
     # Create model
     print("Creating model...")
     model = ScreenBBoxTRMModel(config=model_config, device=str(device))
     model = model.to(device)
     
-    # Print parameter counts
+    # Print and log parameter counts
     param_counts = model.count_parameters()
     print(f"Model parameters:")
     for k, v in param_counts.items():
         print(f"  {k}: {v:,}")
+    
+    if use_wandb:
+        wandb.log({"model/params_" + k: v for k, v in param_counts.items()}, step=0)
     
     # Create datasets
     print("Loading datasets...")
@@ -308,6 +317,12 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     
+    if use_wandb:
+        wandb.log({
+            "data/train_samples": len(train_dataset),
+            "data/val_samples": len(val_dataset),
+        }, step=0)
+    
     # Dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -326,7 +341,7 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
         pin_memory=True,
     )
     
-    # Optimizer (only trainable params)
+    # Optimizer
     trainable_params = model.get_trainable_params()
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -373,12 +388,12 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
         # Train
         global_step = train_epoch(
             model, train_loader, optimizer, criterion, device,
-            config, epoch + 1, global_step, total_steps, ema
+            config, epoch + 1, global_step, total_steps, ema,
+            use_wandb=use_wandb,
         )
         
         # Evaluate
         if (epoch + 1) % config.eval_interval == 0:
-            # Use EMA model for evaluation if available
             eval_model = ema.ema_copy(model) if ema else model
             eval_model = eval_model.to(device)
             
@@ -387,6 +402,13 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
             print(f"\nValidation metrics:")
             for k, v in metrics.items():
                 print(f"  {k}: {v:.4f}")
+            
+            # Log to wandb
+            if use_wandb:
+                val_metrics = {f"val/{k}": v for k, v in metrics.items()}
+                val_metrics["val/best_iou"] = max(best_iou, metrics["iou_mean"])
+                val_metrics["val/epoch"] = epoch + 1
+                wandb.log(val_metrics, step=global_step)
             
             # Save best model
             if config.save_best and metrics["iou_mean"] > best_iou:
@@ -401,8 +423,17 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
                     "train_config": asdict(config),
                 }, save_path)
                 print(f"Saved best model (IoU: {best_iou:.4f})")
+                
+                # Log model artifact to wandb
+                if use_wandb:
+                    artifact = wandb.Artifact(
+                        name=f"best-model-{wandb.run.id}",
+                        type="model",
+                        metadata={"iou_mean": best_iou, "epoch": epoch + 1}
+                    )
+                    artifact.add_file(str(save_path))
+                    wandb.log_artifact(artifact)
             
-            # Clean up
             if ema:
                 del eval_model
     
@@ -415,6 +446,14 @@ def train(config: TrainConfig, model_config: ModelConfig) -> None:
         "model_config": asdict(model_config),
         "train_config": asdict(config),
     }, checkpoint_dir / "final_model.pt")
+    
+    # Log final summary
+    if use_wandb:
+        wandb.log({
+            "final/best_iou": best_iou,
+            "final/epochs_trained": config.epochs,
+        }, step=global_step)
+        wandb.finish()
     
     print(f"\nTraining complete!")
     print(f"Best validation IoU: {best_iou:.4f}")
@@ -438,6 +477,12 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
+    
+    # Wandb options
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
     
     args = parser.parse_args()
     
@@ -472,6 +517,16 @@ def main():
         train_config.checkpoint_dir = args.checkpoint_dir
     if args.device:
         train_config.device = args.device
+    
+    # Wandb overrides
+    if args.wandb:
+        train_config.use_wandb = True
+    if args.no_wandb:
+        train_config.use_wandb = False
+    if args.wandb_project:
+        train_config.wandb_project = args.wandb_project
+    if args.wandb_run_name:
+        train_config.wandb_run_name = args.wandb_run_name
     
     # Run training
     train(train_config, model_config)

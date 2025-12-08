@@ -32,6 +32,12 @@ log_interval: 100      # Log every N batches
 checkpoint_dir: "checkpoints/"
 save_best: true
 
+# Weights & Biases logging
+use_wandb: true
+wandb_project: "screenspot-trm"
+wandb_run_name: null   # Auto-generated if null
+wandb_entity: null     # Your wandb username/team
+
 # Device and workers
 # Options: "auto", "cuda", "mps", "cpu"
 # "auto" will use CUDA if available, then MPS, then CPU
