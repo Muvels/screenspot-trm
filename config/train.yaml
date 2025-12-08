@@ -1,0 +1,42 @@
+# Training configuration for ScreenSpot TRM
+# ==========================================
+
+# Data paths
+train_path: "dataset/screenspot_training.parquet"
+val_split: 0.1  # 10% for validation
+
+# Training hyperparameters
+batch_size: 32
+epochs: 50
+lr: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 1000
+grad_clip: 1.0
+
+# TRM-specific settings
+# use_ema: Use Exponential Moving Average for evaluation
+use_ema: true
+ema_rate: 0.999
+
+# deep_supervision: Apply loss to intermediate TRM predictions
+deep_supervision: true
+deep_supervision_weight: 0.1
+
+# Loss configuration
+# Options: "smooth_l1", "l1", "mse", "giou"
+loss_type: "smooth_l1"
+
+# Logging and checkpoints
+eval_interval: 1       # Evaluate every N epochs
+log_interval: 100      # Log every N batches
+checkpoint_dir: "checkpoints/"
+save_best: true
+
+# Device and workers
+# Options: "auto", "cuda", "mps", "cpu"
+# "auto" will use CUDA if available, then MPS, then CPU
+device: "auto"
+num_workers: 4
+
+# Reproducibility
+seed: 42

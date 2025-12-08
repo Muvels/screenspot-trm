@@ -1,0 +1,13 @@
+[project]
+name = "screenspot-trm"
+version = "0.1.0"
+description = "Merge screenspot datasets"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=3.0.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "huggingface-hub>=0.20.0",
+    "pillow>=10.0.0",
+]
