@@ -31,7 +31,10 @@ import yaml
 from models.fusion import CLIPFusion
 from models.trm_core import TRMController
 from models.bbox_head import BBoxHead
-from utils import BBoxLoss, EMAHelper, compute_metrics
+from utils import (
+    BBoxLoss, EMAHelper, compute_metrics, compute_iou,
+    log_samples_to_wandb, save_sample_images, load_image_from_parquet_row,
+)
 
 # Optional wandb import
 try:
@@ -106,6 +109,11 @@ class TrainConfig:
     log_interval: int = 100
     checkpoint_dir: str = "checkpoints/"
     save_best: bool = True
+    
+    # Sample visualization
+    gen_samples: int = 0           # Number of samples to visualize (0 = disabled)
+    interval_samples: int = 500    # Generate samples every N steps
+    samples_dir: str = "samples/"  # Directory for local sample storage
     
     # Wandb
     use_wandb: bool = True
@@ -284,10 +292,87 @@ def evaluate(model, dataloader, criterion, device):
     return metrics
 
 
+@torch.no_grad()
+def generate_sample_visualizations(
+    model, df, embeddings, sample_indices, device, config, global_step, use_wandb,
+):
+    """Generate and log/save sample visualizations.
+    
+    Args:
+        model: The model to use for inference
+        df: DataFrame with image data
+        embeddings: Dict with img_embeddings and txt_embeddings
+        sample_indices: Indices of samples to visualize
+        device: Device to run inference on
+        config: Training config
+        global_step: Current training step
+        use_wandb: Whether to log to wandb
+    """
+    model.eval()
+    
+    images = []
+    pred_bboxes = []
+    gt_bboxes = []
+    tasks = []
+    
+    img_embeddings = embeddings["img_embeddings"]
+    txt_embeddings = embeddings["txt_embeddings"]
+    
+    for idx in sample_indices:
+        # Load original image
+        row = df.iloc[idx]
+        img = load_image_from_parquet_row(row)
+        images.append(img)
+        
+        # Get task
+        tasks.append(str(row["task"]))
+        
+        # Get ground truth bbox
+        bbox = row["bbox"]
+        if isinstance(bbox, (list, tuple)):
+            gt_bbox = torch.tensor(bbox, dtype=torch.float32)
+        else:
+            gt_bbox = torch.tensor(list(bbox), dtype=torch.float32)
+        gt_bboxes.append(gt_bbox)
+        
+        # Get embeddings and run inference
+        img_emb = img_embeddings[idx].unsqueeze(0).to(device)
+        txt_emb = txt_embeddings[idx].unsqueeze(0).to(device)
+        
+        pred_bbox, _ = model(img_emb, txt_emb, return_intermediates=False)
+        pred_bboxes.append(pred_bbox.squeeze(0).cpu())
+    
+    # Stack tensors
+    pred_bboxes = torch.stack(pred_bboxes)
+    gt_bboxes = torch.stack(gt_bboxes)
+    
+    # Compute IoUs
+    ious = compute_iou(pred_bboxes, gt_bboxes)
+    
+    # Log to wandb or save locally
+    if use_wandb:
+        try:
+            log_samples_to_wandb(
+                images, pred_bboxes, gt_bboxes, tasks, ious, 
+                step=global_step, prefix="samples"
+            )
+        except Exception as e:
+            print(f"Failed to log samples to wandb: {e}")
+    
+    # Also save locally
+    save_sample_images(
+        images, pred_bboxes, gt_bboxes, tasks,
+        output_dir=config.samples_dir,
+        step=global_step,
+    )
+    
+    print(f"  Generated {len(images)} sample visualizations (mean IoU: {ious.mean():.3f})")
+
+
 def train_epoch(
     model, dataloader, optimizer, criterion, device,
     config, epoch, global_step, total_steps, ema=None,
-    use_wandb=False,
+    use_wandb=False, df=None, embeddings=None, sample_indices=None,
 ):
     model.train()
     
@@ -355,6 +440,16 @@ def train_epoch(
                     "train/epoch": epoch,
                     "train/step": global_step,
                 }, step=global_step)
+        
+        # Generate sample visualizations
+        if (config.gen_samples > 0 and 
+            global_step % config.interval_samples == 0 and
+            df is not None and embeddings is not None and sample_indices is not None):
+            generate_sample_visualizations(
+                model, df, embeddings, sample_indices, device,
+                config, global_step, use_wandb,
+            )
+            model.train()  # Restore training mode
     
     # Log epoch summary
     epoch_time = time.time() - epoch_start_time
@@ -398,6 +493,18 @@ def train(config: TrainConfig):
     clip_dim = emb_data["embed_dim"]
     print(f"  CLIP dim: {clip_dim}")
     print(f"  Samples: {emb_data['n_samples']}")
+    
+    # Load parquet for sample visualization (if enabled)
+    df = None
+    sample_indices = None
+    if config.gen_samples > 0:
+        print(f"Loading parquet for sample visualization...")
+        df = pd.read_parquet(config.parquet_path)
+        # Select random sample indices for visualization
+        n_total = len(df)
+        torch.manual_seed(config.seed + 1)  # Different seed for sample selection
+        sample_indices = torch.randperm(n_total)[:config.gen_samples].tolist()
+        print(f"  Will visualize {config.gen_samples} samples every {config.interval_samples} steps")
     
     # Create model
     print("Creating TRM model (no CLIP)...")
@@ -494,7 +601,7 @@ def train(config: TrainConfig):
         global_step = train_epoch(
             model, train_loader, optimizer, criterion, device,
             config, epoch + 1, global_step, total_steps, ema,
-            use_wandb=use_wandb,
+            use_wandb=use_wandb, df=df, embeddings=emb_data, sample_indices=sample_indices,
         )
         
         if (epoch + 1) % config.eval_interval == 0:
@@ -578,6 +685,12 @@ def main():
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     
+    # Sample visualization
+    parser.add_argument("--gen-samples", type=int, default=None,
+                        help="Number of samples to visualize during training")
+    parser.add_argument("--interval-samples", type=int, default=None,
+                        help="Generate sample visualizations every N steps")
+    
     args = parser.parse_args()
     
     config = TrainConfig()
@@ -613,6 +726,12 @@ def main():
         config.wandb_project = args.wandb_project
     if args.wandb_run_name:
         config.wandb_run_name = args.wandb_run_name
+    
+    # Sample visualization overrides
+    if args.gen_samples is not None:
+        config.gen_samples = args.gen_samples
+    if args.interval_samples is not None:
+        config.interval_samples = args.interval_samples
     
     train(config)
 

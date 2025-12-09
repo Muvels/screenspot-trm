@@ -10,5 +10,7 @@ wheels/
 .venv
 dataset/
 checkpoints/
+samples/
 ExampleTinyRecursiveModels/
 .DS_Store
+wandb/

@@ -38,6 +38,11 @@ wandb_project: "screenspot-trm"
 wandb_run_name: null   # Auto-generated if null
 wandb_entity: null     # Your wandb username/team
 
+# Sample visualization during training
+gen_samples: 8           # Number of samples to visualize (0 = disabled)
+interval_samples: 500    # Generate visualizations every N steps
+samples_dir: "samples/"  # Directory for local sample storage
+
 # Device and workers
 # Options: "auto", "cuda", "mps", "cpu"
 # "auto" will use CUDA if available, then MPS, then CPU

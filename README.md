@@ -123,6 +123,24 @@ python train_cached.py --no-wandb
 
 Best models are also saved as wandb artifacts for easy versioning.
 
+### Sample Visualization
+
+Visualize model predictions during training with bounding box overlays:
+
+```bash
+# Generate 8 sample visualizations every 500 steps
+python train_cached.py --gen-samples 8 --interval-samples 500
+
+# Samples are logged to wandb (if enabled) and saved locally to samples/
+```
+
+Each visualization shows:
+- **Red box**: Model prediction
+- **Green box**: Ground truth
+- **Caption**: Task description and IoU score
+
+![Sample visualization example](samples/sample_step000500_sample000.png)
+
 ### Configuration
 
 Edit `config/model.yaml` for model architecture:
