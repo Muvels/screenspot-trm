@@ -68,7 +68,7 @@ class TrainConfig:
     val_split: float = 0.1
     
     # Training - tuned for better convergence
-    batch_size: int = 64
+    batch_size: int = 8
     epochs: int = 100  # More epochs
     lr: float = 3e-4   # Higher LR with warmup
     weight_decay: float = 0.05
