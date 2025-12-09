@@ -70,8 +70,15 @@ def main():
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--clip-model", type=str, default="ViT-B-16")
     parser.add_argument("--clip-pretrained", type=str, default="openai")
+    parser.add_argument("--fp16", action="store_true", default=True,
+                        help="Save embeddings in float16 (default: True, saves ~50%% memory)")
+    parser.add_argument("--fp32", action="store_true",
+                        help="Save embeddings in float32 (uses more memory)")
     
     args = parser.parse_args()
+    
+    # fp32 flag overrides fp16
+    use_fp16 = args.fp16 and not args.fp32
     
     device = get_device(args.device)
     print(f"Using device: {device}")
@@ -99,10 +106,13 @@ def main():
     print(f"  Patch dim: {patch_dim}")
     print(f"  Num patches: {num_patches}")
     
-    # Pre-allocate tensors
-    img_pooled = torch.zeros(n_samples, embed_dim, dtype=torch.float32)
-    img_patches = torch.zeros(n_samples, num_patches, patch_dim, dtype=torch.float32)
-    txt_embeddings = torch.zeros(n_samples, embed_dim, dtype=torch.float32)
+    # Pre-allocate tensors in the target dtype to avoid memory spike during conversion
+    storage_dtype = torch.float16 if use_fp16 else torch.float32
+    print(f"  Storage dtype: {storage_dtype} (saves memory during computation)")
+    
+    img_pooled = torch.zeros(n_samples, embed_dim, dtype=storage_dtype)
+    img_patches = torch.zeros(n_samples, num_patches, patch_dim, dtype=storage_dtype)
+    txt_embeddings = torch.zeros(n_samples, embed_dim, dtype=storage_dtype)
     
     # Process in batches
     print(f"Computing embeddings (batch_size={args.batch_size})...")
@@ -122,16 +132,17 @@ def main():
             # Encode
             pooled, patches, txt_emb = clip(images, tasks)
             
-            # Store
-            img_pooled[start_idx:end_idx] = pooled.cpu()
-            img_patches[start_idx:end_idx] = patches.cpu()
-            txt_embeddings[start_idx:end_idx] = txt_emb.cpu()
+            # Store (convert to storage dtype on-the-fly to save memory)
+            img_pooled[start_idx:end_idx] = pooled.cpu().to(storage_dtype)
+            img_patches[start_idx:end_idx] = patches.cpu().to(storage_dtype)
+            txt_embeddings[start_idx:end_idx] = txt_emb.cpu().to(storage_dtype)
     
-    # Save
+    # Save (already in correct dtype - no conversion needed!)
     output_path = args.output_path
     if output_path is None:
         data_path = Path(args.data_path)
-        output_path = data_path.parent / f"{data_path.stem}.embeddings_patches.pt"
+        suffix = "_fp16" if use_fp16 else ""
+        output_path = data_path.parent / f"{data_path.stem}.embeddings_patches{suffix}.pt"
     
     print(f"Saving embeddings to: {output_path}")
     torch.save({
@@ -146,15 +157,17 @@ def main():
         "grid_size": clip.num_patches,
         "n_samples": n_samples,
         "source_file": str(args.data_path),
+        "dtype": "float16" if use_fp16 else "float32",
     }, output_path)
     
-    file_size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+    file_size_gb = Path(output_path).stat().st_size / (1024**3)
     print(f"\nDone!")
     print(f"  Samples: {n_samples}")
     print(f"  Embed dim (pooled/text): {embed_dim}")
     print(f"  Patch dim: {patch_dim}")
     print(f"  Patches per image: {num_patches}")
-    print(f"  File size: {file_size_mb:.1f} MB")
+    print(f"  Dtype: {'float16' if use_fp16 else 'float32'}")
+    print(f"  File size: {file_size_gb:.2f} GB")
 
 
 if __name__ == "__main__":

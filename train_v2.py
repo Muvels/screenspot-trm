@@ -1,35 +1,40 @@
-"""Training script V2: Uses patch embeddings + cross-attention + GIoU loss.
+"""Training script V2 (On-the-fly): Computes CLIP embeddings during training.
 
-Improvements over v1:
-1. Uses CLIP patch embeddings (not just pooled) for spatial information
-2. Cross-attention fusion between text and image patches
-3. GIoU loss for better gradients on non-overlapping boxes
-4. Larger model capacity
+This version does NOT require precomputed embeddings - it computes them on-the-fly.
+This trades compute time for memory savings (no 30-60GB embeddings file needed).
+
+Advantages:
+- No precomputation step required
+- No large embeddings file to store
+- Lower RAM usage (only batch-sized embeddings in memory)
+
+Disadvantages:
+- Slightly slower training (CLIP forward pass each batch)
+- Requires GPU memory for CLIP model during training
 
 Usage:
-    # First, precompute patch embeddings
-    python precompute_embeddings_patches.py --data-path dataset/screenspot_training.parquet
-    
-    # Then train
-    python train_cached_v2.py --embeddings-path dataset/screenspot_training.embeddings_patches.pt
+    python train_v2.py --parquet-path dataset/screenspot_training.parquet --wandb --epochs 50
 """
 
 import argparse
+import io
 import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import yaml
 
+from models.clip_backbone_patches import CLIPBackboneWithPatches
 from models.fusion_attention import CrossAttentionFusion, SpatialAwareFusion
 from models.trm_core import TRMController
 from models.bbox_head import BBoxHead
@@ -61,43 +66,46 @@ def get_device(requested: str = "auto") -> torch.device:
 
 @dataclass
 class TrainConfig:
-    """Training configuration V2 with improved defaults."""
+    """Training configuration V2 (on-the-fly embeddings)."""
     # Data
     parquet_path: str = "dataset/screenspot_training.parquet"
-    embeddings_path: str = "dataset/screenspot_training.embeddings_patches.pt"
     val_split: float = 0.1
     
+    # CLIP model
+    clip_model: str = "ViT-B-16"
+    clip_pretrained: str = "openai"
+    
     # Training - tuned for better convergence
-    batch_size: int = 64
-    epochs: int = 100  # More epochs
-    lr: float = 3e-4   # Higher LR with warmup
+    batch_size: int = 32  # Smaller due to CLIP overhead
+    epochs: int = 100
+    lr: float = 3e-4
     weight_decay: float = 0.05
-    warmup_steps: int = 2000  # More warmup
+    warmup_steps: int = 2000
     grad_clip: float = 1.0
     
     # TRM - larger capacity
     use_ema: bool = True
     ema_rate: float = 0.999
     deep_supervision: bool = True
-    deep_supervision_weight: float = 0.2  # Higher weight
+    deep_supervision_weight: float = 0.2
     
     # Model - improved architecture
-    trm_hidden_size: int = 384  # Larger
-    H_cycles: int = 4  # More recursion
-    L_cycles: int = 6  # More inner loops
+    trm_hidden_size: int = 384
+    H_cycles: int = 4
+    L_cycles: int = 6
     L_layers: int = 2
     expansion: float = 4.0
-    bbox_hidden_dim: int = 256  # Larger head
-    bbox_output_format: str = "cxcywh"  # More stable
-    fusion_type: str = "cross_attention"  # Use cross-attention
+    bbox_hidden_dim: int = 256
+    bbox_output_format: str = "cxcywh"
+    fusion_type: str = "cross_attention"
     fusion_num_heads: int = 8
     fusion_num_layers: int = 2
     
-    # Loss - use combined loss
-    loss_type: str = "giou"  # GIoU for better gradients
+    # Loss
+    loss_type: str = "giou"
     use_combined_loss: bool = True
     coord_weight: float = 1.0
-    giou_weight: float = 2.0  # Emphasize IoU
+    giou_weight: float = 2.0
     
     # Logging
     eval_interval: int = 1
@@ -122,52 +130,19 @@ class TrainConfig:
     seed: int = 42
 
 
-def load_embeddings(embeddings_path: str, device: str = "cpu"):
-    """Load embeddings once and share between datasets.
-    
-    Converts to float32 for training if stored as float16.
-    Uses memory-efficient loading.
-    """
-    print(f"Loading embeddings from: {embeddings_path}")
-    data = torch.load(embeddings_path, map_location=device, weights_only=False)
-    
-    # Convert float16 to float32 for training stability if needed
-    # but keep on CPU to save GPU memory - will move to GPU per batch
-    for key in ['img_pooled', 'img_patches', 'txt_embeddings']:
-        if key in data and data[key].dtype == torch.float16:
-            data[key] = data[key].float()
-    
-    embed_dim = data["embed_dim"]
-    patch_dim = data.get("patch_dim", embed_dim)
-    num_patches = data["num_patches"]
-    
-    size_gb = sum(data[k].numel() * data[k].element_size() for k in ['img_pooled', 'img_patches', 'txt_embeddings']) / (1024**3)
-    print(f"  Loaded {len(data['img_pooled'])} samples, {size_gb:.2f} GB in RAM")
-    print(f"  embed_dim={embed_dim}, patch_dim={patch_dim}, num_patches={num_patches}")
-    
-    return data
-
-
-class CachedPatchDataset(Dataset):
-    """Dataset with patch embeddings - uses shared embeddings dict."""
+class OnTheFlyDataset(Dataset):
+    """Dataset that returns raw images and text for on-the-fly embedding."""
     
     def __init__(
         self,
         parquet_path: str,
-        embeddings_data: dict,  # Shared embeddings dict (not path!)
+        preprocess,  # CLIP preprocessing transform
         split: str = "train",
         val_split: float = 0.1,
         seed: int = 42,
     ):
         self.df = pd.read_parquet(parquet_path)
-        
-        # Use shared embeddings (no copy, just reference)
-        self.img_pooled = embeddings_data["img_pooled"]
-        self.img_patches = embeddings_data["img_patches"]
-        self.txt_embeddings = embeddings_data["txt_embeddings"]
-        self.embed_dim = embeddings_data["embed_dim"]
-        self.patch_dim = embeddings_data.get("patch_dim", embeddings_data["embed_dim"])
-        self.num_patches = embeddings_data["num_patches"]
+        self.preprocess = preprocess
         
         n = len(self.df)
         indices = list(range(n))
@@ -185,10 +160,28 @@ class CachedPatchDataset(Dataset):
     def __len__(self):
         return len(self.indices)
     
+    def _load_image(self, row):
+        """Load and preprocess image from parquet row."""
+        img_data = row["image"]
+        if isinstance(img_data, dict):
+            img_bytes = img_data["bytes"]
+        else:
+            img_bytes = img_data
+        
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return self.preprocess(image)
+    
     def __getitem__(self, idx):
         row_idx = self.indices[idx]
         row = self.df.iloc[row_idx]
         
+        # Load and preprocess image
+        image_tensor = self._load_image(row)
+        
+        # Get text
+        task = str(row["task"])
+        
+        # Get bbox
         bbox = row["bbox"]
         if isinstance(bbox, (list, tuple)):
             bbox = torch.tensor(bbox, dtype=torch.float32)
@@ -196,26 +189,24 @@ class CachedPatchDataset(Dataset):
             bbox = torch.tensor(list(bbox), dtype=torch.float32)
         
         return {
-            "img_pooled": self.img_pooled[row_idx],
-            "img_patches": self.img_patches[row_idx],
-            "txt_emb": self.txt_embeddings[row_idx],
+            "image": image_tensor,
+            "task": task,
             "bbox": bbox,
             "row_idx": row_idx,
         }
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, Tensor]:
+def collate_fn(batch: List[Dict]) -> Dict:
     return {
-        "img_pooled": torch.stack([b["img_pooled"] for b in batch]),
-        "img_patches": torch.stack([b["img_patches"] for b in batch]),
-        "txt_embs": torch.stack([b["txt_emb"] for b in batch]),
+        "images": torch.stack([b["image"] for b in batch]),
+        "tasks": [b["task"] for b in batch],
         "bboxes": torch.stack([b["bbox"] for b in batch]),
         "row_indices": [b["row_idx"] for b in batch],
     }
 
 
 class TRMModelV2(nn.Module):
-    """Improved TRM model with cross-attention fusion."""
+    """TRM model with cross-attention fusion (same as cached version)."""
     
     def __init__(self, config: TrainConfig, clip_dim: int = 512, patch_dim: int = 768):
         super().__init__()
@@ -223,19 +214,18 @@ class TRMModelV2(nn.Module):
         self.clip_dim = clip_dim
         self.patch_dim = patch_dim
         
-        # Cross-attention fusion - patches are patch_dim, text is clip_dim
         if config.fusion_type == "cross_attention":
             self.fusion = CrossAttentionFusion(
-                clip_dim=patch_dim,  # patches are patch_dim (768)
-                txt_dim=clip_dim,    # text is clip_dim (512)
+                clip_dim=patch_dim,
+                txt_dim=clip_dim,
                 trm_dim=config.trm_hidden_size,
                 num_heads=config.fusion_num_heads,
                 num_layers=config.fusion_num_layers,
             )
         else:
             self.fusion = SpatialAwareFusion(
-                clip_dim=patch_dim,  # patches are patch_dim (768)
-                txt_dim=clip_dim,    # text is clip_dim (512)
+                clip_dim=patch_dim,
+                txt_dim=clip_dim,
                 trm_dim=config.trm_hidden_size,
                 num_heads=config.fusion_num_heads,
                 num_layers=config.fusion_num_layers,
@@ -256,7 +246,6 @@ class TRMModelV2(nn.Module):
         )
     
     def forward(self, img_patches, txt_emb, img_pooled=None, return_intermediates=False):
-        # Fusion handles different dims internally
         h_ctx = self.fusion(img_patches, txt_emb, img_pooled)
         y_final, intermediates = self.trm(h_ctx, return_intermediates)
         bbox_pred = self.bbox_head(y_final)
@@ -289,27 +278,23 @@ class CombinedLoss(nn.Module):
         self.ds_weight = ds_weight
     
     def _giou_loss(self, pred, target):
-        # Ensure valid boxes
         pred_x1 = torch.min(pred[..., 0], pred[..., 2])
         pred_y1 = torch.min(pred[..., 1], pred[..., 3])
         pred_x2 = torch.max(pred[..., 0], pred[..., 2])
         pred_y2 = torch.max(pred[..., 1], pred[..., 3])
         
-        # Intersection
         inter_x1 = torch.max(pred_x1, target[..., 0])
         inter_y1 = torch.max(pred_y1, target[..., 1])
         inter_x2 = torch.min(pred_x2, target[..., 2])
         inter_y2 = torch.min(pred_y2, target[..., 3])
         inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
         
-        # Union
         pred_area = (pred_x2 - pred_x1) * (pred_y2 - pred_y1)
         target_area = (target[..., 2] - target[..., 0]) * (target[..., 3] - target[..., 1])
         union = pred_area + target_area - inter
         
         iou = inter / union.clamp(min=1e-6)
         
-        # Enclosing
         enc_x1 = torch.min(pred_x1, target[..., 0])
         enc_y1 = torch.min(pred_y1, target[..., 1])
         enc_x2 = torch.max(pred_x2, target[..., 2])
@@ -352,19 +337,25 @@ def set_lr(optimizer, lr):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, clip_encoder, dataloader, criterion, device):
+    """Evaluate model with on-the-fly embeddings."""
     model.eval()
+    clip_encoder.eval()
+    
     total_loss = 0.0
     all_preds, all_targets = [], []
     
     for batch in tqdm(dataloader, desc="Evaluating", leave=False):
-        img_patches = batch["img_patches"].to(device)
-        txt_embs = batch["txt_embs"].to(device)
+        images = batch["images"].to(device)
+        tasks = batch["tasks"]
         bboxes = batch["bboxes"].to(device)
+        
+        # Compute embeddings on-the-fly
+        img_pooled, img_patches, txt_embs = clip_encoder(images, tasks)
         
         pred, _ = model(img_patches, txt_embs, return_intermediates=False)
         loss = criterion(pred, bboxes)
-        total_loss += loss.item() * len(img_patches)
+        total_loss += loss.item() * len(images)
         
         all_preds.append(pred.cpu())
         all_targets.append(bboxes.cpu())
@@ -378,8 +369,11 @@ def evaluate(model, dataloader, criterion, device):
 
 
 @torch.no_grad()
-def generate_samples(model, df, embeddings, indices, device, config, step, use_wandb):
+def generate_samples(model, clip_encoder, df, indices, device, config, step, use_wandb):
+    """Generate sample predictions for visualization."""
     model.eval()
+    clip_encoder.eval()
+    
     images, preds, gts, tasks = [], [], [], []
     
     for idx in indices:
@@ -392,10 +386,11 @@ def generate_samples(model, df, embeddings, indices, device, config, step, use_w
         gt = torch.tensor(bbox if isinstance(bbox, list) else list(bbox), dtype=torch.float32)
         gts.append(gt)
         
-        patches = embeddings["img_patches"][idx].unsqueeze(0).to(device)
-        txt = embeddings["txt_embeddings"][idx].unsqueeze(0).to(device)
+        # Preprocess and encode
+        img_tensor = clip_encoder.preprocess(img).unsqueeze(0).to(device)
+        _, img_patches, txt_emb = clip_encoder(img_tensor, [str(row["task"])])
         
-        pred, _ = model(patches, txt)
+        pred, _ = model(img_patches, txt_emb)
         preds.append(pred.squeeze(0).cpu())
     
     preds = torch.stack(preds)
@@ -412,16 +407,26 @@ def generate_samples(model, df, embeddings, indices, device, config, step, use_w
     print(f"  Samples: mean IoU = {ious.mean():.3f}")
 
 
-def train_epoch(model, loader, optimizer, criterion, device, config, epoch, step, total_steps, ema, use_wandb, df=None, emb=None, sample_idx=None):
+def train_epoch(
+    model, clip_encoder, loader, optimizer, criterion, device, config,
+    epoch, step, total_steps, ema, use_wandb, df=None, sample_idx=None
+):
+    """Train for one epoch with on-the-fly embedding computation."""
     model.train()
+    clip_encoder.eval()  # Keep CLIP frozen
+    
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     running_loss = 0.0
     t0 = time.time()
     
     for i, batch in enumerate(pbar):
-        img_patches = batch["img_patches"].to(device)
-        txt_embs = batch["txt_embs"].to(device)
+        images = batch["images"].to(device)
+        tasks = batch["tasks"]
         bboxes = batch["bboxes"].to(device)
+        
+        # Compute embeddings on-the-fly (no gradient for CLIP)
+        with torch.no_grad():
+            img_pooled, img_patches, txt_embs = clip_encoder(images, tasks)
         
         lr = cosine_schedule_with_warmup(step, total_steps, config.warmup_steps, config.lr)
         set_lr(optimizer, lr)
@@ -451,7 +456,7 @@ def train_epoch(model, loader, optimizer, criterion, device, config, epoch, step
                 wandb.log({"train/loss": loss.item(), "train/lr": lr, "train/step": step}, step=step)
         
         if config.gen_samples > 0 and step % config.interval_samples == 0 and df is not None:
-            generate_samples(model, df, emb, sample_idx, device, config, step, use_wandb)
+            generate_samples(model, clip_encoder, df, sample_idx, device, config, step, use_wandb)
             model.train()
     
     return step
@@ -464,33 +469,71 @@ def train(config: TrainConfig):
     
     use_wandb = config.use_wandb and WANDB_AVAILABLE
     if use_wandb:
-        wandb.init(project=config.wandb_project, entity=config.wandb_entity, 
-                   name=config.wandb_run_name, config=asdict(config), tags=["v2", "patches"])
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.wandb_run_name,
+            config=asdict(config),
+            tags=["v2", "on-the-fly"]
+        )
     
-    # Load embeddings ONCE and share between datasets
-    emb = load_embeddings(config.embeddings_path)
-    clip_dim = emb["embed_dim"]  # 512 for pooled/text
-    patch_dim = emb.get("patch_dim", clip_dim)  # 768 for patches
+    # Load CLIP encoder (frozen, for on-the-fly embeddings)
+    print(f"Loading CLIP model: {config.clip_model}")
+    clip_encoder = CLIPBackboneWithPatches(
+        model_name=config.clip_model,
+        pretrained=config.clip_pretrained,
+        device=str(device),
+    )
+    clip_encoder.freeze()
+    clip_dim = clip_encoder.embed_dim  # 512
+    patch_dim = clip_encoder.patch_dim  # 768
+    print(f"  CLIP dim: {clip_dim}, patch dim: {patch_dim}")
     
+    # Load parquet for sample visualization
     df = pd.read_parquet(config.parquet_path)
     sample_idx = torch.randperm(len(df))[:config.gen_samples].tolist() if config.gen_samples > 0 else None
     
-    # Model - use patch_dim for fusion since we're using patch embeddings
+    # Create model
     model = TRMModelV2(config, clip_dim=clip_dim, patch_dim=patch_dim).to(device)
     params = model.count_parameters()
-    print(f"Parameters: {params}")
+    print(f"Model parameters: {params}")
     if use_wandb:
         wandb.log({f"model/{k}": v for k, v in params.items()}, step=0)
     
-    # Data - both datasets share the same embeddings dict (no duplication!)
-    train_ds = CachedPatchDataset(config.parquet_path, emb, "train", config.val_split, config.seed)
-    val_ds = CachedPatchDataset(config.parquet_path, emb, "val", config.val_split, config.seed)
+    # Create datasets with CLIP preprocessing
+    train_ds = OnTheFlyDataset(
+        config.parquet_path,
+        clip_encoder.preprocess,
+        "train",
+        config.val_split,
+        config.seed
+    )
+    val_ds = OnTheFlyDataset(
+        config.parquet_path,
+        clip_encoder.preprocess,
+        "val",
+        config.val_split,
+        config.seed
+    )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     
-    train_loader = DataLoader(train_ds, config.batch_size, shuffle=True, num_workers=config.num_workers, collate_fn=collate_fn, pin_memory=True)
-    val_loader = DataLoader(val_ds, config.batch_size, shuffle=False, num_workers=config.num_workers, collate_fn=collate_fn, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=config.num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds, config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
     
-    # Optimizer & Loss
+    # Optimizer & Loss (only for TRM model, not CLIP)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     criterion = CombinedLoss(config.coord_weight, config.giou_weight, config.deep_supervision_weight)
     
@@ -509,11 +552,15 @@ def train(config: TrainConfig):
     for epoch in range(config.epochs):
         print(f"\n{'='*50}\nEpoch {epoch+1}/{config.epochs}\n{'='*50}")
         
-        step = train_epoch(model, train_loader, optimizer, criterion, device, config, epoch+1, step, total_steps, ema, use_wandb, df, emb, sample_idx)
+        step = train_epoch(
+            model, clip_encoder, train_loader, optimizer, criterion,
+            device, config, epoch+1, step, total_steps, ema, use_wandb,
+            df, sample_idx
+        )
         
         if (epoch + 1) % config.eval_interval == 0:
             eval_model = ema.ema_copy(model).to(device) if ema else model
-            metrics = evaluate(eval_model, val_loader, criterion, device)
+            metrics = evaluate(eval_model, clip_encoder, val_loader, criterion, device)
             
             print("Validation:")
             for k, v in metrics.items():
@@ -525,7 +572,12 @@ def train(config: TrainConfig):
             
             if metrics["iou_mean"] > best_iou:
                 best_iou = metrics["iou_mean"]
-                torch.save({"model": eval_model.state_dict(), "config": asdict(config), "metrics": metrics, "epoch": epoch+1}, ckpt_dir / "best.pt")
+                torch.save({
+                    "model": eval_model.state_dict(),
+                    "config": asdict(config),
+                    "metrics": metrics,
+                    "epoch": epoch+1
+                }, ckpt_dir / "best.pt")
                 print(f"Saved best (IoU: {best_iou:.4f})")
             
             if ema:
@@ -537,8 +589,7 @@ def train(config: TrainConfig):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--embeddings-path", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Train TRM V2 with on-the-fly embeddings")
     parser.add_argument("--parquet-path", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -548,12 +599,12 @@ def main():
     parser.add_argument("--gen-samples", type=int, default=None)
     parser.add_argument("--interval-samples", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--clip-model", type=str, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
     
     args = parser.parse_args()
     config = TrainConfig()
     
-    if args.embeddings_path:
-        config.embeddings_path = args.embeddings_path
     if args.parquet_path:
         config.parquet_path = args.parquet_path
     if args.epochs:
@@ -572,6 +623,10 @@ def main():
         config.interval_samples = args.interval_samples
     if args.device:
         config.device = args.device
+    if args.clip_model:
+        config.clip_model = args.clip_model
+    if args.num_workers is not None:
+        config.num_workers = args.num_workers
     
     train(config)
 
