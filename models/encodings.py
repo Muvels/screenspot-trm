@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoProcessor, CLIPModel, CLIPProcessor
+from transformers import AutoModel, AutoProcessor, CLIPModel
 
 class VisionTextEncoder(nn.Module):
     """
@@ -15,18 +15,21 @@ class VisionTextEncoder(nn.Module):
         
         # Load CLIP (Vision + Text)
         # We use the full CLIPModel to get access to both towers
-        self.backbone = CLIPModel.from_pretrained(model_name)
+        # Load model using AutoModel to support both CLIP and SigLIP
+        self.backbone = AutoModel.from_pretrained(model_name)
         
         if freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
                 
-        self.hidden_size = self.backbone.config.projection_dim
-        # Actually CLIP vision/text hidden sizes might differ before projection.
-        # We should project them to a common dimension if we use the raw hidden states.
-        
-        self.vis_hidden = self.backbone.vision_model.config.hidden_size
-        self.txt_hidden = self.backbone.text_model.config.hidden_size
+        # Detect hidden sizes
+        if hasattr(self.backbone.config, "vision_config"):
+            self.vis_hidden = self.backbone.config.vision_config.hidden_size
+            self.txt_hidden = self.backbone.config.text_config.hidden_size
+        else:
+            # Fallback for standard CLIP if config structure differs
+            self.vis_hidden = self.backbone.vision_model.config.hidden_size
+            self.txt_hidden = self.backbone.text_model.config.hidden_size
         
         # Common dimension for the TRM
         self.out_dim = 512 # configurable

@@ -1,9 +1,11 @@
-import argparse
-import pandas as pd
 import torch
-from transformers import CLIPProcessor
-import logging
+import pandas as pd
+from transformers import AutoProcessor
+import argparse
 from tqdm import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
+import logging
 import os
 
 def preprocess_dataset(input_path: str, output_path: str, model_name: str, batch_size: int = 1000):
@@ -21,8 +23,8 @@ def preprocess_dataset(input_path: str, output_path: str, model_name: str, batch
         logger.error(f"Failed to load dataset: {e}")
         return
 
-    logger.info(f"Initializing processor: {model_name}")
-    processor = CLIPProcessor.from_pretrained(model_name)
+    logger.info(f"Loading processor for {model_name}...")
+    processor = AutoProcessor.from_pretrained(model_name)
     
     # We will process in chunks to show progress
     input_ids_list = []
@@ -55,10 +57,22 @@ def preprocess_dataset(input_path: str, output_path: str, model_name: str, batch
         # Actually standard parquet handles lists of varying length, but for ML training 
         # we usually want fixed max_len or we pad in COLLATE_FN.
         # However, CLIP expects max_length=77 usually.
-        encoded = processor(text=batch_tasks, return_tensors="np", padding="max_length", truncation=True, max_length=77)
+        encoded = processor(text=batch_tasks, return_tensors="np", padding="max_length", truncation=True, max_length=64) # SigLIP uses shorter context usually, keeping 64-77 is safe
         
-        input_ids_list.extend(encoded["input_ids"].tolist())
-        attention_mask_list.extend(encoded["attention_mask"].tolist())
+        input_ids = encoded["input_ids"]
+        if "attention_mask" in encoded:
+            attn_mask = encoded["attention_mask"]
+        else:
+            # Generate mask: 1 for non-pad tokens, 0 for pad tokens
+            # We need to access the tokenizer's pad_token_id.
+            # Usually processor.tokenizer exists.
+            pad_id = processor.tokenizer.pad_token_id
+            if pad_id is None:
+                 pad_id = 0 # Fallback
+            attn_mask = (input_ids != pad_id).astype("int64")
+
+        input_ids_list.extend(input_ids.tolist())
+        attention_mask_list.extend(attn_mask.tolist())
         
     # Add columns
     logger.info("Adding new columns to dataframe...")

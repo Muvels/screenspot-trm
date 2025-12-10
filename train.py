@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--mode", type=str, default="train", choices=["train", "sample"], help="train or sample mode")
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")
+    parser.add_argument("--model_name", type=str, default="google/siglip-so400m-patch14-384")
     
     # WandB & Sampling flags
     parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
