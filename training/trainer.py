@@ -36,6 +36,38 @@ class Trainer:
         
         self.step = 0
         
+    # Common helper for forward pass
+    def _forward_batch(self, batch):
+        pixel_values = batch["pixel_values"].to(self.device)
+        gt_bbox = batch["ground_truth_bbox"].to(self.device)
+        
+        # Extra args for Qwen
+        kwargs = {}
+        if "image_grid_thw" in batch:
+            kwargs["image_grid_thw"] = batch["image_grid_thw"].to(self.device)
+
+        # Check for pre-tokenized data
+        if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
+            input_ids = batch["input_ids"].to(self.device)
+            attn_mask = batch["attention_mask"].to(self.device)
+        else:
+            # Fallback: Tokenize on fly
+            if not hasattr(self, "_processor"):
+                # Handle text processor override
+                if hasattr(self.agent.encoder, "is_qwen") and self.agent.encoder.is_qwen:
+                     # Use fallback CLIP for text
+                     self._processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                else:
+                     self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
+                
+            instructions = batch["instruction"]
+            text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
+            input_ids = text_inputs.input_ids
+            attn_mask = text_inputs.attention_mask
+            
+        pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask, **kwargs)
+        return pred_bbox, value_pred, gt_bbox
+
     def train_supervised_epoch(self, epoch: int):
         """
         Train one epoch using Supervised Regression (MSE/L1 + IoU Loss).
@@ -46,28 +78,7 @@ class Trainer:
         for batch in pbar:
             self.optimizer.zero_grad()
             
-            # Prepare data
-            pixel_values = batch["pixel_values"].to(self.device)
-            gt_bbox = batch["ground_truth_bbox"].to(self.device)
-            
-            # Check for pre-tokenized data
-            if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
-                # Assuming collation handled stacking, but Parquet list -> Tensor in Dataset might mean we have (B, L)
-                # If dataset returned valid tensors, DataLoader stacks them.
-                input_ids = batch["input_ids"].to(self.device)
-                attn_mask = batch["attention_mask"].to(self.device)
-            else:
-                # Fallback: Tokenize on fly (CACHE THE PROCESSOR!)
-                if not hasattr(self, "_processor"):
-                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
-                    
-                instructions = batch["instruction"]
-                text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
-                input_ids = text_inputs.input_ids
-                attn_mask = text_inputs.attention_mask
-            
-            # Forward
-            pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)
+            pred_bbox, _, gt_bbox = self._forward_batch(batch)
             
             # Loss: L1 + IoU Loss (1 - IoU)
             loss_l1 = nn.functional.l1_loss(pred_bbox, gt_bbox)
@@ -104,26 +115,12 @@ class Trainer:
             self.optimizer.zero_grad()
             
             # 1. Forward (Sampling Action)
-            # Same tokenization logic
-            # 1. Forward (Sampling Action)
-            pixel_values = batch["pixel_values"].to(self.device)
-            gt_bbox = batch["ground_truth_bbox"].to(self.device)
+            # Re-use helper logic but need value_pred
+            # Actually _forward_batch returns value_pred too but I ignored it in supervised
             
-            # Check for pre-tokenized data
-            if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
-                input_ids = batch["input_ids"].to(self.device)
-                attn_mask = batch["attention_mask"].to(self.device)
-            else:
-                 if not hasattr(self, "_processor"):
-                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
-                    
-                 instructions = batch["instruction"]
-                 text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
-                 input_ids = text_inputs.input_ids
-                 attn_mask = text_inputs.attention_mask
-            gt_bbox = batch["ground_truth_bbox"].to(self.device)
-
-            pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)
+            # COPY PASTE of logic or use Helper?
+            # Using helper to keep consistent
+            pred_bbox, value_pred, gt_bbox = self._forward_batch(batch)
             
             # 2. Compute Reward
             # In online RL we would 'act' and get external reward.

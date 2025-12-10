@@ -39,12 +39,13 @@ class InfoMaxAgent(nn.Module):
         self.policy_head = BBoxPolicyHead(input_dim=hidden_size)
         self.value_head = ValueHead(input_dim=hidden_size)
         
-    def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+    def forward(self, pixel_values: torch.Tensor, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs):
         """
         Args:
-            pixel_values: (B, C, H, W)
+            pixel_values: (B, C, H, W) or specific format
             input_ids: (B, L)
             attention_mask: (B, L)
+            kwargs: e.g. image_grid_thw
             
         Returns:
             bbox: (B, 4)
@@ -52,7 +53,7 @@ class InfoMaxAgent(nn.Module):
             final_state: (B, Seq, H)
         """
         # 1. Encode
-        context = self.encoder(pixel_values, input_ids, attention_mask) # (B, Seq, H)
+        context = self.encoder(pixel_values, input_ids, attention_mask, **kwargs) # (B, Seq, H)
         
         # 2. Recurse
         final_context_state = self.core(context) # (B, Seq, H)

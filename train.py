@@ -31,14 +31,25 @@ def main():
     
     # 1. Setup Data
     logger.info("Initializing Dataset...")
-    # Using CLIPProcessor for transform if we want consistent image norm, 
-    # but Dataset currently uses default ToTensor if no transform passed.
-    # To be precise, we should use CLIP's image processor.
-    processor = CLIPProcessor.from_pretrained(args.model_name)
+    
+    # Switch to AutoProcessor
+    from transformers import AutoProcessor
+    try:
+        processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+    except Exception as e:
+        logger.warning(f"Could not load AutoProcessor for {args.model_name}, falling back to CLIPProcessor.")
+        processor = CLIPProcessor.from_pretrained(args.model_name)
+
     def transform(image):
-        # CLIP inputs: pixel_values
-        inputs = processor(images=image, return_tensors="pt")
-        return inputs['pixel_values'].squeeze(0) # (C, H, W)
+        # Handle Qwen-VL vs CLIP
+        # Qwen-VL processor returns 'pixel_values' and 'image_grid_thw'
+        try:
+            inputs = processor(images=image, return_tensors="pt")
+            # Return dict directly to be handled in collate
+            return {k: v.squeeze(0) for k, v in inputs.items()} 
+        except Exception:
+            # Fallback
+            return processor(images=image, return_tensors="pt")['pixel_values'].squeeze(0)
     
     try:
         dataset = ScreenspotDataset(args.data_path, transform=transform)
@@ -56,8 +67,54 @@ def main():
     val_size = len(dataset) - train_size
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0) # workers=0 for simplicity
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    def qwen_collate_fn(batch):
+        # Custom collate to handle Qwen specific fields if present
+        # Batch is list of dicts
+        
+        # Check if first sample has dict as pixel_values (our wrapper logic might have put it there? 
+        # No, ScreenspotDataset puts the return of transform into 'pixel_values' key)
+        
+        pixel_val_sample = batch[0]["pixel_values"]
+        is_qwen_dict = isinstance(pixel_val_sample, dict) and "image_grid_thw" in pixel_val_sample
+        
+        collated = {}
+        
+        # Handle pixel_values
+        if is_qwen_dict:
+            # Qwen Batching: 
+            # pixel_values -> Concatenate all (Sum_T, D)
+            # image_grid_thw -> Concatenate (B, 3)
+            pvs = [b["pixel_values"]["pixel_values"] for b in batch]
+            grids = [b["pixel_values"]["image_grid_thw"] for b in batch]
+            
+            collated["pixel_values"] = torch.cat(pvs, dim=0)
+            collated["image_grid_thw"] = torch.cat(grids, dim=0) # Pass as kwarg
+        else:
+            # Standard stacking
+            collated["pixel_values"] = torch.stack([b["pixel_values"] for b in batch])
+            
+        # Handle others
+        # Instruction / input_ids (Padding needed?)
+        # For simplicity, assume standard collate for others or manual padding
+        # Let's use default collate for simple fields, but input_ids might be variable length?
+        # Dataset currently returns (L,) tensor for input_ids.
+        
+        if batch[0]["input_ids"] is not None:
+             # Pad sequences
+             input_ids = [b["input_ids"] for b in batch]
+             attention_mask = [b["attention_mask"] for b in batch]
+             collated["input_ids"] = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=processor.tokenizer.pad_token_id if hasattr(processor, "tokenizer") else 0)
+             collated["attention_mask"] = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        else:
+            # Raw text instructions
+            collated["instruction"] = [b["instruction"] for b in batch]
+            
+        collated["ground_truth_bbox"] = torch.stack([b["ground_truth_bbox"] for b in batch])
+        
+        return collated
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=qwen_collate_fn) 
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=qwen_collate_fn)
     
     # 2. Setup Agent
     logger.info("Initializing Agent...")
