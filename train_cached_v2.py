@@ -6,11 +6,17 @@ Improvements over v1:
 3. GIoU loss for better gradients on non-overlapping boxes
 4. Larger model capacity
 
+Supports both single-file and sharded embeddings formats.
+
 Usage:
-    # First, precompute patch embeddings
-    python precompute_embeddings_patches.py --data-path dataset/screenspot_training.parquet
+    # First, precompute patch embeddings (sharded to disk)
+    python precompute_embeddings_patches.py --data-path dataset/screenspot_training.parquet \
+        --shard-size 5000
     
-    # Then train
+    # Then train (auto-detects shards)
+    python train_cached_v2.py --embeddings-path dataset/screenspot_training_patch_embeddings.pt
+    
+    # Or with legacy single file:
     python train_cached_v2.py --embeddings-path dataset/screenspot_training.embeddings_patches.pt
 """
 
@@ -64,15 +70,16 @@ class TrainConfig:
     """Training configuration V2 with improved defaults."""
     # Data
     parquet_path: str = "dataset/screenspot_training.parquet"
-    embeddings_path: str = "dataset/screenspot_training.embeddings_patches.pt"
+    embeddings_path: str = "dataset/screenspot_training_patch_embeddings.pt"  # supports shards
     val_split: float = 0.1
     
     # Training - tuned for better convergence
-    batch_size: int = 8
+    batch_size: int = 32
     epochs: int = 100  # More epochs
-    lr: float = 3e-4   # Higher LR with warmup
-    weight_decay: float = 0.05
-    warmup_steps: int = 2000  # More warmup
+    lr: float = 1.0e-4   # Higher LR for faster convergence
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.02  # 5% of total steps for warmup (auto-scaled)
+    warmup_steps: int = -1  # -1 means use warmup_ratio instead
     grad_clip: float = 1.0
     
     # TRM - larger capacity
@@ -88,7 +95,7 @@ class TrainConfig:
     L_layers: int = 2
     expansion: float = 4.0
     bbox_hidden_dim: int = 256  # Larger head
-    bbox_output_format: str = "cxcywh"  # More stable
+    bbox_output_format: str = "xyxy"  # More stable
     fusion_type: str = "cross_attention"  # Use cross-attention
     fusion_num_heads: int = 8
     fusion_num_layers: int = 2
@@ -122,28 +129,131 @@ class TrainConfig:
     seed: int = 42
 
 
+def find_shard_files(embeddings_path: str) -> List[Path]:
+    """Find all shard files matching the pattern, or return single file."""
+    path = Path(embeddings_path)
+    
+    # Check if this is a sharded path (contains _shard_ pattern)
+    # Or if the exact file exists
+    if path.exists():
+        # Single file format
+        return [path]
+    
+    # Try to find shards - the path might be a base path
+    # Look for pattern: {stem}_shard_*.pt
+    parent = path.parent
+    stem = path.stem
+    
+    # Remove _shard_XXXXX suffix if present to get base stem
+    import re
+    base_stem = re.sub(r'_shard_\d+$', '', stem)
+    
+    # Find all matching shards
+    shard_pattern = f"{base_stem}_shard_*.pt"
+    shards = sorted(parent.glob(shard_pattern))
+    
+    if shards:
+        return shards
+    
+    # Also try without any suffix manipulation
+    shard_pattern2 = f"{stem}_shard_*.pt"
+    shards = sorted(parent.glob(shard_pattern2))
+    
+    if shards:
+        return shards
+    
+    # No shards found, raise error
+    raise FileNotFoundError(
+        f"Could not find embeddings at '{embeddings_path}' or matching shards. "
+        f"Looked for: {parent / shard_pattern}"
+    )
+
+
 def load_embeddings(embeddings_path: str, device: str = "cpu"):
     """Load embeddings once and share between datasets.
     
+    Supports both:
+    - Single file format (legacy)
+    - Sharded format (new, memory-efficient)
+    
     Converts to float32 for training if stored as float16.
-    Uses memory-efficient loading.
     """
-    print(f"Loading embeddings from: {embeddings_path}")
-    data = torch.load(embeddings_path, map_location=device, weights_only=False)
+    shard_files = find_shard_files(embeddings_path)
     
-    # Convert float16 to float32 for training stability if needed
-    # but keep on CPU to save GPU memory - will move to GPU per batch
-    for key in ['img_pooled', 'img_patches', 'txt_embeddings']:
-        if key in data and data[key].dtype == torch.float16:
-            data[key] = data[key].float()
+    if len(shard_files) == 1:
+        # Single file format
+        print(f"Loading embeddings from: {shard_files[0]}")
+        data = torch.load(shard_files[0], map_location=device, weights_only=False)
+        
+        # Convert float16 to float32 for training stability
+        for key in ['img_pooled', 'img_patches', 'txt_embeddings']:
+            if key in data and data[key].dtype == torch.float16:
+                data[key] = data[key].float()
+        
+        embed_dim = data["embed_dim"]
+        patch_dim = data.get("patch_dim", embed_dim)
+        num_patches = data["num_patches"]
+        
+        size_gb = sum(data[k].numel() * data[k].element_size() for k in ['img_pooled', 'img_patches', 'txt_embeddings']) / (1024**3)
+        print(f"  Loaded {len(data['img_pooled'])} samples, {size_gb:.2f} GB in RAM")
+        print(f"  embed_dim={embed_dim}, patch_dim={patch_dim}, num_patches={num_patches}")
+        
+        return data
     
-    embed_dim = data["embed_dim"]
-    patch_dim = data.get("patch_dim", embed_dim)
-    num_patches = data["num_patches"]
+    # Sharded format - load and concatenate
+    print(f"Loading {len(shard_files)} shards from: {shard_files[0].parent}")
+    
+    all_img_pooled = []
+    all_img_patches = []
+    all_txt_embeddings = []
+    
+    # Load first shard to get metadata
+    first_shard = torch.load(shard_files[0], map_location=device, weights_only=False)
+    embed_dim = first_shard["embed_dim"]
+    patch_dim = first_shard.get("patch_dim", embed_dim)
+    num_patches = first_shard["num_patches"]
+    total_samples = first_shard.get("dataset_n_samples", first_shard["n_samples"])
+    
+    print(f"  Total samples expected: {total_samples}")
+    print(f"  embed_dim={embed_dim}, patch_dim={patch_dim}, num_patches={num_patches}")
+    
+    # Load all shards
+    for shard_path in tqdm(shard_files, desc="Loading shards"):
+        shard = torch.load(shard_path, map_location=device, weights_only=False)
+        
+        # Convert to float32 if needed
+        img_pooled = shard["img_pooled"]
+        img_patches = shard["img_patches"]
+        txt_embeddings = shard["txt_embeddings"]
+        
+        if img_pooled.dtype == torch.float16:
+            img_pooled = img_pooled.float()
+            img_patches = img_patches.float()
+            txt_embeddings = txt_embeddings.float()
+        
+        all_img_pooled.append(img_pooled)
+        all_img_patches.append(img_patches)
+        all_txt_embeddings.append(txt_embeddings)
+        
+        # Free memory
+        del shard
+    
+    # Concatenate all shards
+    print("  Concatenating shards...")
+    data = {
+        "img_pooled": torch.cat(all_img_pooled, dim=0),
+        "img_patches": torch.cat(all_img_patches, dim=0),
+        "txt_embeddings": torch.cat(all_txt_embeddings, dim=0),
+        "embed_dim": embed_dim,
+        "patch_dim": patch_dim,
+        "num_patches": num_patches,
+    }
+    
+    # Free intermediate lists
+    del all_img_pooled, all_img_patches, all_txt_embeddings
     
     size_gb = sum(data[k].numel() * data[k].element_size() for k in ['img_pooled', 'img_patches', 'txt_embeddings']) / (1024**3)
-    print(f"  Loaded {len(data['img_pooled'])} samples, {size_gb:.2f} GB in RAM")
-    print(f"  embed_dim={embed_dim}, patch_dim={patch_dim}, num_patches={num_patches}")
+    print(f"  Loaded {len(data['img_pooled'])} samples total, {size_gb:.2f} GB in RAM")
     
     return data
 
@@ -169,7 +279,16 @@ class CachedPatchDataset(Dataset):
         self.patch_dim = embeddings_data.get("patch_dim", embeddings_data["embed_dim"])
         self.num_patches = embeddings_data["num_patches"]
         
-        n = len(self.df)
+        # Use the SMALLER of parquet rows or embeddings length
+        # This handles partial shard loading correctly
+        n_parquet = len(self.df)
+        n_embeddings = len(self.img_pooled)
+        n = min(n_parquet, n_embeddings)
+        
+        if n_parquet != n_embeddings:
+            print(f"  Warning: parquet has {n_parquet} rows but embeddings has {n_embeddings} samples")
+            print(f"  Using first {n} samples only")
+        
         indices = list(range(n))
         
         rng = torch.Generator().manual_seed(seed)
@@ -412,7 +531,7 @@ def generate_samples(model, df, embeddings, indices, device, config, step, use_w
     print(f"  Samples: mean IoU = {ious.mean():.3f}")
 
 
-def train_epoch(model, loader, optimizer, criterion, device, config, epoch, step, total_steps, ema, use_wandb, df=None, emb=None, sample_idx=None):
+def train_epoch(model, loader, optimizer, criterion, device, config, epoch, step, total_steps, warmup_steps, ema, use_wandb, df=None, emb=None, sample_idx=None):
     model.train()
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     running_loss = 0.0
@@ -423,7 +542,7 @@ def train_epoch(model, loader, optimizer, criterion, device, config, epoch, step
         txt_embs = batch["txt_embs"].to(device)
         bboxes = batch["bboxes"].to(device)
         
-        lr = cosine_schedule_with_warmup(step, total_steps, config.warmup_steps, config.lr)
+        lr = cosine_schedule_with_warmup(step, total_steps, warmup_steps, config.lr)
         set_lr(optimizer, lr)
         
         pred, intermediates = model(img_patches, txt_embs, return_intermediates=config.deep_supervision)
@@ -473,7 +592,10 @@ def train(config: TrainConfig):
     patch_dim = emb.get("patch_dim", clip_dim)  # 768 for patches
     
     df = pd.read_parquet(config.parquet_path)
-    sample_idx = torch.randperm(len(df))[:config.gen_samples].tolist() if config.gen_samples > 0 else None
+    
+    # Sample indices must be within embeddings range (may be smaller than parquet)
+    n_valid = min(len(df), len(emb["img_pooled"]))
+    sample_idx = torch.randperm(n_valid)[:config.gen_samples].tolist() if config.gen_samples > 0 else None
     
     # Model - use patch_dim for fusion since we're using patch embeddings
     model = TRMModelV2(config, clip_dim=clip_dim, patch_dim=patch_dim).to(device)
@@ -499,7 +621,13 @@ def train(config: TrainConfig):
         ema.register(model)
     
     total_steps = config.epochs * len(train_loader)
-    print(f"Total steps: {total_steps}")
+    
+    # Auto-scale warmup based on total steps
+    if config.warmup_steps < 0:
+        warmup_steps = int(total_steps * config.warmup_ratio)
+    else:
+        warmup_steps = config.warmup_steps
+    print(f"Total steps: {total_steps}, warmup: {warmup_steps} ({100*warmup_steps/total_steps:.1f}%)")
     
     ckpt_dir = Path(config.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -509,7 +637,7 @@ def train(config: TrainConfig):
     for epoch in range(config.epochs):
         print(f"\n{'='*50}\nEpoch {epoch+1}/{config.epochs}\n{'='*50}")
         
-        step = train_epoch(model, train_loader, optimizer, criterion, device, config, epoch+1, step, total_steps, ema, use_wandb, df, emb, sample_idx)
+        step = train_epoch(model, train_loader, optimizer, criterion, device, config, epoch+1, step, total_steps, warmup_steps, ema, use_wandb, df, emb, sample_idx)
         
         if (epoch + 1) % config.eval_interval == 0:
             eval_model = ema.ema_copy(model).to(device) if ema else model
