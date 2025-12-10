@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--sample_interval", type=int, default=100, help="Steps between sampling")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
+    parser.add_argument("--max_samples", type=int, default=None, help="Limit dataset size for debugging")
     
     args = parser.parse_args()
     
@@ -44,6 +45,11 @@ def main():
         logger.error(f"Dataset not found at {args.data_path}. Please check path.")
         return
 
+    # Limit dataset if max_samples is set
+    if args.max_samples and args.max_samples < len(dataset):
+        logger.info(f"Limiting dataset to {args.max_samples} samples for debugging.")
+        indices = torch.arange(args.max_samples)
+        dataset = torch.utils.data.Subset(dataset, indices)
     # Split (Mock split for now)
     train_size = int(0.9 * len(dataset))
     val_size = len(dataset) - train_size

@@ -122,7 +122,7 @@ class Trainer:
                  attn_mask = text_inputs.attention_mask
             gt_bbox = batch["ground_truth_bbox"].to(self.device)
 
-            pred_bbox, value_pred, _ = self.agent(pixel_values, text_inputs.input_ids, text_inputs.attention_mask)
+            pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)
             
             # 2. Compute Reward
             # In online RL we would 'act' and get external reward.
