@@ -1,0 +1,23 @@
+# Core ML
+torch
+numpy
+pandas
+pyarrow
+Pillow
+
+# Encoders & Text
+transformers
+tokenizers
+huggingface_hub
+
+# Training / Utils
+wandb
+tqdm
+einops
+pydantic
+omegaconf
+hydra-core
+
+# Reference TRM deps (optional subset)
+adam-atan2
+coolname
