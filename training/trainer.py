@@ -9,7 +9,7 @@ from transformers import CLIPProcessor
 from typing import Optional, Dict
 
 from models.agent import InfoMaxAgent
-from training.rewards import compute_iou, compute_reward
+from training.rewards import compute_iou, compute_reward, compute_giou
 
 class Trainer:
     """
@@ -72,7 +72,8 @@ class Trainer:
             # Loss: L1 + IoU Loss (1 - IoU)
             loss_l1 = nn.functional.l1_loss(pred_bbox, gt_bbox)
             iou = compute_iou(pred_bbox, gt_bbox)
-            loss_iou = 1.0 - iou.mean()
+            giou = compute_giou(pred_bbox, gt_bbox)
+            loss_iou = 1.0 - giou.mean()
             
             loss = loss_l1 + loss_iou
             
@@ -175,7 +176,10 @@ class Trainer:
             # For this implementation, let's Stick to Differentiable Reward Maximization (IoU) 
             # as it matches the "Screen Grounding" problem well.
             
-            loss_policy = -compute_iou(pred_bbox, gt_bbox).mean()
+            # Optimizing GIoU directly as a proxy for "Policy Gradient" on deterministic policy
+            # This is robust because GIoU provides signal even if IoU=0
+            giou = compute_giou(pred_bbox, gt_bbox)
+            loss_policy = -giou.mean()
             loss = loss_policy + 0.5 * value_loss
             
             loss.backward()

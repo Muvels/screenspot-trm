@@ -27,6 +27,35 @@ def compute_iou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
     
     return intersection_area / union_area
 
+def compute_giou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
+    """
+    Generalized IoU: IoU - (C - U) / C
+    where C is the smallest enclosing box.
+    """
+    # Intersection
+    x1 = torch.max(box1[:, 0], box2[:, 0])
+    y1 = torch.max(box1[:, 1], box2[:, 1])
+    x2 = torch.min(box1[:, 2], box2[:, 2])
+    y2 = torch.min(box1[:, 3], box2[:, 3])
+    
+    intersection_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+    
+    box1_area = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    box2_area = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    
+    union_area = box1_area + box2_area - intersection_area + 1e-6
+    iou = intersection_area / union_area
+    
+    # Enclosing Box
+    cX1 = torch.min(box1[:, 0], box2[:, 0])
+    cY1 = torch.min(box1[:, 1], box2[:, 1])
+    cX2 = torch.max(box1[:, 2], box2[:, 2])
+    cY2 = torch.max(box1[:, 3], box2[:, 3])
+    
+    c_area = (cX2 - cX1) * (cY2 - cY1) + 1e-6
+    
+    return iou - (c_area - union_area) / c_area
+
 def compute_reward(pred_box: torch.Tensor, gt_box: torch.Tensor, alpha: float = 2.0) -> torch.Tensor:
     """
     Reward function for RL.
