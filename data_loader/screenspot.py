@@ -1,6 +1,8 @@
-import io
+import pyarrow.parquet as pq
+import pyarrow as pa
 import torch
-import pandas as pd
+import numpy as np
+import io
 from PIL import Image
 from torch.utils.data import Dataset
 from typing import Optional, Callable, Dict, Any
@@ -36,26 +38,38 @@ class ScreenspotDataset(Dataset):
 
         logging.info(f"Loading dataset from {parquet_path}...")
         try:
-            self.df = pd.read_parquet(parquet_path)
-            logging.info(f"Loaded {len(self.df)} examples.")
+            # We use PyArrow Table for potentially better handling of nested types
+            # or simply load it; if pandas fails, we can stick to pyarrow.
+            self.table = pq.read_table(parquet_path)
+            logging.info(f"Loaded {self.table.num_rows} examples.")
         except Exception as e:
             logging.error(f"Failed to load parquet file: {e}")
             raise e
 
     def __len__(self):
-        return len(self.df)
+        return self.table.num_rows
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        row = self.df.iloc[idx]
+        # Accessing PyArrow row is tricky efficiently, but for random access:
+        # We can slice the table or convert just the row to py dict.
+        # slicing: table.slice(idx, length=1)
+        # But this might be slow if repeating every time.
+        # Ideally we might convert columns to numpy arrays if they fit in memory (images might not).
+        # Let's try converting the single row to a python dict which handles the conversion.
+        
+        # NOTE: self.table[col][idx] is reasonably fast for column-oriented access.
         
         # 1. Decode Image
         try:
-            image_entry = row['image']
-            if isinstance(image_entry, dict) and 'bytes' in image_entry:
-                image_bytes = image_entry['bytes']
+            # We flattened it to bytes in preprocess.py, so it should be direct bytes now
+            # OR it might still be the struct if using original file.
+            # Let's handle both.
+            image_val = self.table["image"][idx].as_py()
+            
+            if isinstance(image_val, dict) and 'bytes' in image_val:
+                image_bytes = image_val['bytes']
             else:
-                 # Backup if format is strictly bytes
-                 image_bytes = image_entry
+                 image_bytes = image_val
             
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         except Exception as e:
@@ -64,22 +78,34 @@ class ScreenspotDataset(Dataset):
             
         original_size = image.size # (W, H)
 
-        # 2. Apply Transform (Vision Encoder Preprocessing)
+        # 2. Apply Transform
         if self.transform:
             pixel_values = self.transform(image)
         else:
-            # Default to tensor if no transform
             import torchvision.transforms as T
             pixel_values = T.ToTensor()(image)
 
-        # 3. Get Instruction
-        instruction = row['task']
-        if instruction is None:
-            instruction = ""
+        # 3. Get Instruction / Tokenized Features
+        # Check if pre-tokenized columns exist in schema
+        table_cols = self.table.column_names
+        
+        if "input_ids" in table_cols:
+             input_ids_list = self.table["input_ids"][idx].as_py()
+             attn_mask_list = self.table["attention_mask"][idx].as_py()
+             
+             import numpy as np
+             input_ids = torch.tensor(np.array(input_ids_list), dtype=torch.long)
+             attention_mask = torch.tensor(np.array(attn_mask_list), dtype=torch.long)
+             instruction = "" 
+        else:
+             instruction = self.table["task"][idx].as_py()
+             if instruction is None:
+                 instruction = ""
+             input_ids = None
+             attention_mask = None
 
         # 4. Get Bounding Box
-        # Ensure it's a tensor of float32
-        bbox = row['bbox'] # [x1, y1, x2, y2] normalized
+        bbox = self.table["bbox"][idx].as_py() # [x1, y1, x2, y2]
         if bbox is None: 
             bbox = [0.0, 0.0, 0.0, 0.0]
         
@@ -88,8 +114,10 @@ class ScreenspotDataset(Dataset):
         return {
             "pixel_values": pixel_values,
             "instruction": instruction,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
             "ground_truth_bbox": bbox_tensor,
-            "original_size": torch.tensor(original_size) # (W, H)
+            "original_size": torch.tensor(original_size)
         }
 
 if __name__ == "__main__":

@@ -47,33 +47,24 @@ class Trainer:
             self.optimizer.zero_grad()
             
             # Prepare data
-            # Images need to be stacked carefully if sizes differ, but processor usually pads/resizes
             pixel_values = batch["pixel_values"].to(self.device)
-            # input_ids from text? We need to tokenize if loader didn't. 
-            # Loader returned raw text. We need to handle tokenization here or in loader.
-            # Let's assume we tokenize here for simplicity or using the agent's processor.
-            # Actually Agent has the encoder inside, maybe we expose processor or use a global one.
-            # TODO: Add tokenization logic. Assuming batch['input_ids'] is present or we tokenize 'instruction'.
+            gt_bbox = batch["ground_truth_bbox"].to(self.device)
             
-            # Temporary fix: Tokenize on fly (slow but works for prototype)
-            instructions = batch["instruction"]
-            processor = self.agent.encoder.backbone.processor if hasattr(self.agent.encoder.backbone, "processor") else \
-                        (CLIPProcessor.from_pretrained(self.agent.encoder.model_name) if "clip" in self.agent.encoder.model_name else None)
-            
-            # CLIP processor call
-            if processor:
-                # If pixel_values is already tensor, we just need text.
-                # But typical CLIPProcessor expects raw images + text.
-                # We already transformed images in Dataset using standard transforms.
-                # Just tokenize text:
-                text_inputs = float_inputs = processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
+            # Check for pre-tokenized data
+            if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
+                # Assuming collation handled stacking, but Parquet list -> Tensor in Dataset might mean we have (B, L)
+                # If dataset returned valid tensors, DataLoader stacks them.
+                input_ids = batch["input_ids"].to(self.device)
+                attn_mask = batch["attention_mask"].to(self.device)
+            else:
+                # Fallback: Tokenize on fly (CACHE THE PROCESSOR!)
+                if not hasattr(self, "_processor"):
+                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
+                    
+                instructions = batch["instruction"]
+                text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
                 input_ids = text_inputs.input_ids
                 attn_mask = text_inputs.attention_mask
-            else:
-                # Mock or other tokenizer
-                raise ValueError("Processor not found for tokenization.")
-
-            gt_bbox = batch["ground_truth_bbox"].to(self.device)
             
             # Forward
             pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)
@@ -113,11 +104,22 @@ class Trainer:
             
             # 1. Forward (Sampling Action)
             # Same tokenization logic
-            instructions = batch["instruction"]
-            processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name) # Cache this!
-            text_inputs = processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
-            
+            # 1. Forward (Sampling Action)
             pixel_values = batch["pixel_values"].to(self.device)
+            gt_bbox = batch["ground_truth_bbox"].to(self.device)
+            
+            # Check for pre-tokenized data
+            if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
+                input_ids = batch["input_ids"].to(self.device)
+                attn_mask = batch["attention_mask"].to(self.device)
+            else:
+                 if not hasattr(self, "_processor"):
+                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
+                    
+                 instructions = batch["instruction"]
+                 text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
+                 input_ids = text_inputs.input_ids
+                 attn_mask = text_inputs.attention_mask
             gt_bbox = batch["ground_truth_bbox"].to(self.device)
 
             pred_bbox, value_pred, _ = self.agent(pixel_values, text_inputs.input_ids, text_inputs.attention_mask)
