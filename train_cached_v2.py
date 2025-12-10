@@ -76,7 +76,7 @@ class TrainConfig:
     # Training - tuned for better convergence
     batch_size: int = 32
     epochs: int = 100  # More epochs
-    lr: float = 1.0e-4   # Higher LR for faster convergence
+    lr: float = 5e-4   # Higher LR for faster convergence
     weight_decay: float = 0.01
     warmup_ratio: float = 0.02  # 5% of total steps for warmup (auto-scaled)
     warmup_steps: int = -1  # -1 means use warmup_ratio instead
@@ -95,7 +95,7 @@ class TrainConfig:
     L_layers: int = 2
     expansion: float = 4.0
     bbox_hidden_dim: int = 256  # Larger head
-    bbox_output_format: str = "xyxy"  # More stable
+    bbox_output_format: str = "cxcywh"  # MUST use cxcywh - xyxy gives zero-area initial boxes!
     fusion_type: str = "cross_attention"  # Use cross-attention
     fusion_num_heads: int = 8
     fusion_num_layers: int = 2
