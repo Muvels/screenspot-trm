@@ -39,13 +39,32 @@ def draw_bbox_on_image(
     width, height = img.size
     
     # Convert normalized coords to pixel coords
+    # Also ensure valid rectangle (x1 <= x2, y1 <= y2)
     def to_pixels(bbox):
-        return [
-            int(bbox[0] * width),
-            int(bbox[1] * height),
-            int(bbox[2] * width),
-            int(bbox[3] * height),
-        ]
+        x1 = int(bbox[0].item() * width) if hasattr(bbox[0], 'item') else int(bbox[0] * width)
+        y1 = int(bbox[1].item() * height) if hasattr(bbox[1], 'item') else int(bbox[1] * height)
+        x2 = int(bbox[2].item() * width) if hasattr(bbox[2], 'item') else int(bbox[2] * width)
+        y2 = int(bbox[3].item() * height) if hasattr(bbox[3], 'item') else int(bbox[3] * height)
+        
+        # Ensure valid rectangle (PIL requires x1 <= x2 and y1 <= y2)
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+        
+        # Clamp to image bounds
+        x1 = max(0, min(x1, width - 1))
+        y1 = max(0, min(y1, height - 1))
+        x2 = max(0, min(x2, width - 1))
+        y2 = max(0, min(y2, height - 1))
+        
+        # Ensure at least 1 pixel size
+        if x2 <= x1:
+            x2 = x1 + 1
+        if y2 <= y1:
+            y2 = y1 + 1
+            
+        return [x1, y1, x2, y2]
     
     # Draw ground truth first (so prediction is on top)
     if gt_bbox is not None:
