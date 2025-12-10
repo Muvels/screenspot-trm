@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--sample_interval", type=int, default=100, help="Steps between sampling")
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit dataset size for debugging")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     
@@ -60,7 +61,18 @@ def main():
     
     # 2. Setup Agent
     logger.info("Initializing Agent...")
+    logger.info("Initializing Agent...")
     agent = InfoMaxAgent(vision_text_model=args.model_name)
+    
+    if args.resume_from:
+        logger.info(f"Resuming from checkpoint: {args.resume_from}")
+        try:
+            state_dict = torch.load(args.resume_from, map_location="cpu") # Load to CPU first
+            agent.load_state_dict(state_dict)
+            logger.info("Checkpoint loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            return
     
     # 3. Setup Trainer
     trainer = Trainer(agent, train_loader, val_loader, lr=args.lr, use_wandb=args.use_wandb)
