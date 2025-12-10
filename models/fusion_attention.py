@@ -113,6 +113,116 @@ class CrossAttentionFusion(nn.Module):
         return output
 
 
+class AttentionLocalizationFusion(nn.Module):
+    """Fusion that uses attention weights for direct localization.
+    
+    Instead of just outputting a pooled vector, this module:
+    1. Computes text-to-patch attention weights
+    2. Uses attention as a soft pointer to relevant patches
+    3. Outputs both a context vector AND spatial coordinates
+    
+    This is much better for localization because the attention
+    weights directly indicate WHERE in the image to look.
+    """
+    
+    def __init__(
+        self,
+        clip_dim: int = 768,
+        txt_dim: Optional[int] = None,
+        trm_dim: int = 256,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        grid_size: int = 14,
+    ):
+        super().__init__()
+        
+        self.clip_dim = clip_dim
+        self.txt_dim = txt_dim if txt_dim is not None else clip_dim
+        self.trm_dim = trm_dim
+        self.grid_size = grid_size
+        self.num_patches = grid_size * grid_size
+        
+        # Project to common dim
+        self.img_proj = nn.Linear(clip_dim, trm_dim)
+        self.txt_proj = nn.Linear(self.txt_dim, trm_dim)
+        
+        # Learnable positional embeddings (2D grid)
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, trm_dim) * 0.02)
+        
+        # Cross-attention for localization
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=trm_dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.attn_norm = nn.LayerNorm(trm_dim)
+        
+        # Spatial coordinate embeddings (encode patch positions)
+        # Each patch at position (i, j) has normalized coords (i/grid_size, j/grid_size)
+        coords = torch.zeros(1, self.num_patches, 4)
+        for i in range(grid_size):
+            for j in range(grid_size):
+                idx = i * grid_size + j
+                # Normalized center of each patch
+                cx = (j + 0.5) / grid_size
+                cy = (i + 0.5) / grid_size
+                # Default width/height (1/grid_size)
+                w = 1.0 / grid_size
+                h = 1.0 / grid_size
+                coords[0, idx] = torch.tensor([cx, cy, w, h])
+        self.register_buffer("patch_coords", coords)
+        
+        # Refinement MLP for bbox (takes attention-weighted features + initial bbox estimate)
+        self.bbox_refine = nn.Sequential(
+            nn.Linear(trm_dim + 4, trm_dim),
+            nn.GELU(),
+            nn.Linear(trm_dim, trm_dim),
+            nn.GELU(),
+        )
+        
+        # Output projection
+        self.output_proj = nn.Linear(trm_dim, trm_dim)
+    
+    def forward(
+        self,
+        img_patches: Tensor,
+        txt_emb: Tensor,
+        img_pooled: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Fuse with attention-based localization.
+        
+        Returns context vector that includes spatial information from attention.
+        """
+        B = img_patches.shape[0]
+        
+        # Project and add positional info
+        patches = self.img_proj(img_patches) + self.pos_embed  # [B, 196, trm_dim]
+        text = self.txt_proj(txt_emb).unsqueeze(1)  # [B, 1, trm_dim]
+        
+        # Cross-attention: text attends to patches
+        # Get attention weights to understand WHERE to look
+        attn_out, attn_weights = self.cross_attn(text, patches, patches)
+        # attn_weights: [B, 1, 196]
+        
+        attended = self.attn_norm(text + attn_out)  # [B, 1, trm_dim]
+        
+        # Use attention weights to get soft bbox estimate
+        # attn_weights indicates which patches are relevant
+        attn_weights_2d = attn_weights.squeeze(1)  # [B, 196]
+        
+        # Weighted sum of patch coordinates using attention
+        # This gives us an initial estimate of where to look
+        weighted_coords = torch.einsum('bp,bpc->bc', attn_weights_2d, 
+                                       self.patch_coords.expand(B, -1, -1))  # [B, 4]
+        
+        # Combine attended features with coordinate estimate
+        combined = torch.cat([attended.squeeze(1), weighted_coords], dim=-1)  # [B, trm_dim + 4]
+        
+        # Refine
+        refined = self.bbox_refine(combined)  # [B, trm_dim]
+        output = self.output_proj(refined)
+        
+        return output
+
+
 class SpatialAwareFusion(nn.Module):
     """Fusion that preserves spatial information for bbox prediction.
     

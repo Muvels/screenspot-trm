@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 import yaml
 
-from models.fusion_attention import CrossAttentionFusion, SpatialAwareFusion
+from models.fusion_attention import CrossAttentionFusion, SpatialAwareFusion, AttentionLocalizationFusion
 from models.trm_core import TRMController
 from models.bbox_head import BBoxHead
 from utils import BBoxLoss, EMAHelper, compute_metrics, compute_iou
@@ -96,7 +96,7 @@ class TrainConfig:
     expansion: float = 4.0
     bbox_hidden_dim: int = 256  # Larger head
     bbox_output_format: str = "cxcywh"  # MUST use cxcywh - xyxy gives zero-area initial boxes!
-    fusion_type: str = "cross_attention"  # Use cross-attention
+    fusion_type: str = "attention_localization"  # Use attention for spatial localization
     fusion_num_heads: int = 8
     fusion_num_layers: int = 2
     
@@ -342,19 +342,28 @@ class TRMModelV2(nn.Module):
         self.clip_dim = clip_dim
         self.patch_dim = patch_dim
         
-        # Cross-attention fusion - patches are patch_dim, text is clip_dim
+        # Fusion - patches are patch_dim, text is clip_dim
         if config.fusion_type == "cross_attention":
             self.fusion = CrossAttentionFusion(
-                clip_dim=patch_dim,  # patches are patch_dim (768)
-                txt_dim=clip_dim,    # text is clip_dim (512)
+                clip_dim=patch_dim,
+                txt_dim=clip_dim,
                 trm_dim=config.trm_hidden_size,
                 num_heads=config.fusion_num_heads,
                 num_layers=config.fusion_num_layers,
             )
+        elif config.fusion_type == "attention_localization":
+            self.fusion = AttentionLocalizationFusion(
+                clip_dim=patch_dim,
+                txt_dim=clip_dim,
+                trm_dim=config.trm_hidden_size,
+                num_heads=config.fusion_num_heads,
+                dropout=0.1,
+                grid_size=14,  # ViT-B/16 with 224x224 -> 14x14 patches
+            )
         else:
             self.fusion = SpatialAwareFusion(
-                clip_dim=patch_dim,  # patches are patch_dim (768)
-                txt_dim=clip_dim,    # text is clip_dim (512)
+                clip_dim=patch_dim,
+                txt_dim=clip_dim,
                 trm_dim=config.trm_hidden_size,
                 num_heads=config.fusion_num_heads,
                 num_layers=config.fusion_num_layers,
