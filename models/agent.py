@@ -4,6 +4,7 @@ from typing import Optional, Dict
 
 from models.encodings import VisionTextEncoder
 from models.trm import TinyRecursiveModel
+from models.standard_transformer import StandardTransformer
 from models.policy import BBoxPolicyHead, ValueHead
 
 class InfoMaxAgent(nn.Module):
@@ -19,7 +20,9 @@ class InfoMaxAgent(nn.Module):
                  vision_text_model: str = "openai/clip-vit-base-patch32", 
                  hidden_size: int = 512, 
                  trm_layers: int = 1,
-                 trm_depth: int = 3):
+                 trm_depth: int = 3,
+                 model_type: str = "trm",
+                 transformer_layers: int = 6):
         super().__init__()
         
         self.encoder = VisionTextEncoder(model_name=vision_text_model, freeze_backbone=True)
@@ -29,12 +32,21 @@ class InfoMaxAgent(nn.Module):
             # For now assume they match
             pass
             
-        self.core = TinyRecursiveModel(
-            hidden_size=hidden_size, 
-            num_heads=8, 
-            num_layers=trm_layers, 
-            recursion_depth=trm_depth
-        )
+        if model_type == "trm":
+            self.core = TinyRecursiveModel(
+                hidden_size=hidden_size, 
+                num_heads=8, 
+                num_layers=trm_layers, 
+                recursion_depth=trm_depth
+            )
+        elif model_type == "transformer":
+            self.core = StandardTransformer(
+                hidden_size=hidden_size,
+                num_heads=8,
+                num_layers=transformer_layers
+            )
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
         
         self.policy_head = BBoxPolicyHead(input_dim=hidden_size)
         self.value_head = ValueHead(input_dim=hidden_size)

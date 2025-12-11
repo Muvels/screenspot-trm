@@ -22,7 +22,7 @@ class Trainer:
                  train_loader: DataLoader, 
                  val_loader: Optional[DataLoader] = None,
                  lr: float = 1e-4,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
+                 device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
                  use_wandb: bool = False):
                  
         self.agent = agent.to(device)
@@ -64,7 +64,7 @@ class Trainer:
                 instructions = batch["instruction"]
                 text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
                 input_ids = text_inputs.input_ids
-                attn_mask = text_inputs.attention_mask
+                attn_mask = getattr(text_inputs, "attention_mask", None)
             
             # Forward
             pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)
@@ -120,7 +120,7 @@ class Trainer:
                  instructions = batch["instruction"]
                  text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
                  input_ids = text_inputs.input_ids
-                 attn_mask = text_inputs.attention_mask
+                 attn_mask = getattr(text_inputs, "attention_mask", None)
             gt_bbox = batch["ground_truth_bbox"].to(self.device)
 
             pred_bbox, value_pred, _ = self.agent(pixel_values, input_ids, attn_mask)

@@ -113,14 +113,18 @@ class ScreenspotDataset(Dataset):
         # Clamp to [0, 1] to avoid out-of-bounds errors found in dataset
         bbox_tensor = torch.clamp(bbox_tensor, 0.0, 1.0)
 
-        return {
+        res = {
             "pixel_values": pixel_values,
             "instruction": instruction,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
             "ground_truth_bbox": bbox_tensor,
             "original_size": torch.tensor(original_size)
         }
+        
+        if input_ids is not None:
+            res["input_ids"] = input_ids
+            res["attention_mask"] = attention_mask
+            
+        return res
 
 if __name__ == "__main__":
     # verification

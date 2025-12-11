@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--mode", type=str, default="train", choices=["train", "sample"], help="train or sample mode")
     parser.add_argument("--model_name", type=str, default="google/siglip-so400m-patch14-384")
+    parser.add_argument("--model_type", type=str, default="trm", choices=["trm", "transformer"], help="Model architecture type")
+    parser.add_argument("--transformer_layers", type=int, default=6, help="Number of layers if model_type is transformer")
     
     # WandB & Sampling flags
     parser.add_argument("--use_wandb", action="store_true", help="Enable W&B logging")
@@ -61,7 +63,11 @@ def main():
     # 2. Setup Agent
     logger.info("Initializing Agent...")
     logger.info("Initializing Agent...")
-    agent = InfoMaxAgent(vision_text_model=args.model_name)
+    agent = InfoMaxAgent(
+        vision_text_model=args.model_name,
+        model_type=args.model_type,
+        transformer_layers=args.transformer_layers
+    )
     
     if args.resume_from:
         logger.info(f"Resuming from checkpoint: {args.resume_from}")
