@@ -32,7 +32,12 @@ class Trainer:
         self.use_wandb = use_wandb
         
         self.optimizer = optim.AdamW(self.agent.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1000) # Simple scheduler
+        
+        # Scheduler: Use length of loader * default epochs (e.g. 1)
+        # Better: T_max = steps per epoch. We step scheduler every batch.
+        # If we want it to reset every epoch, T_max = len(train_loader).
+        steps_per_epoch = len(train_loader) if train_loader is not None else 1000
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=steps_per_epoch)
         
         self.step = 0
         
@@ -238,6 +243,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=1.0)
             
             self.optimizer.step()
+            self.scheduler.step()
             
             metrics = {
                 "train/rl_loss": loss.item(),
