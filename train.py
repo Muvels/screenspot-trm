@@ -88,6 +88,9 @@ def main():
             # 2. RL Phase (Continual)
             trainer.train_rl_epoch(epoch)
             
+            # 3. Validation
+            trainer.validate_epoch(epoch)
+            
             trainer.save_checkpoint(f"checkpoint_ep{epoch}.pt")
             
     elif args.mode == "sample":

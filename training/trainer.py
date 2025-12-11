@@ -111,6 +111,67 @@ class Trainer:
                 wandb.log(metrics)
             
             pbar.set_postfix(loss=loss.item(), iou=final_iou.item())
+
+    def validate_epoch(self, epoch: int):
+        """
+        Run validation loop to detect overfitting.
+        """
+        self.agent.eval()
+        if self.val_loader is None:
+            return
+            
+        total_iou = 0
+        total_loss = 0
+        steps = 0
+        
+        pbar = tqdm.tqdm(self.val_loader, desc=f"Epoch {epoch} (Val)")
+        
+        with torch.no_grad():
+            for batch in pbar:
+                pixel_values = batch["pixel_values"].to(self.device)
+                gt_bbox = batch["ground_truth_bbox"].to(self.device)
+                
+                if batch.get("input_ids") is not None and batch["input_ids"][0] is not None:
+                    input_ids = batch["input_ids"].to(self.device)
+                    attn_mask = batch["attention_mask"].to(self.device)
+                else:
+                    if not hasattr(self, "_processor"):
+                         self._processor = AutoProcessor.from_pretrained(self.agent.encoder.model_name)
+                    instructions = batch["instruction"]
+                    text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
+                    input_ids = text_inputs.input_ids
+                    attn_mask = text_inputs.attention_mask
+                
+                # Forward
+                pred_bbox, _, _ = self.agent(pixel_values, input_ids, attn_mask)
+                
+                # Metrics (Deep Supervision: Use Final Step)
+                pred_final = pred_bbox[:, -1, :]
+                
+                # Loss (Proxy)
+                loss_l1 = nn.functional.l1_loss(pred_final, gt_bbox)
+                giou = compute_giou(pred_final, gt_bbox)
+                loss_val = loss_l1 + (1.0 - giou.mean())
+                
+                # IoU
+                iou = compute_iou(pred_final, gt_bbox)
+                
+                total_loss += loss_val.item()
+                total_iou += iou.mean().item()
+                steps += 1
+                
+                pbar.set_postfix(val_loss=loss_val.item(), val_iou=iou.mean().item())
+        
+        avg_loss = total_loss / steps if steps > 0 else 0
+        avg_iou = total_iou / steps if steps > 0 else 0
+        
+        if self.use_wandb:
+            wandb.log({
+                "val/loss": avg_loss,
+                "val/iou": avg_iou
+            })
+        
+        logging.info(f"Validation Epoch {epoch}: Loss={avg_loss:.4f}, IoU={avg_iou:.4f}")
             
     def train_rl_epoch(self, epoch: int):
         """
