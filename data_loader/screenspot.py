@@ -110,6 +110,8 @@ class ScreenspotDataset(Dataset):
             bbox = [0.0, 0.0, 0.0, 0.0]
         
         bbox_tensor = torch.tensor(bbox, dtype=torch.float32)
+        # Clamp to [0, 1] to avoid out-of-bounds errors found in dataset
+        bbox_tensor = torch.clamp(bbox_tensor, 0.0, 1.0)
 
         return {
             "pixel_values": pixel_values,

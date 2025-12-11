@@ -2,7 +2,7 @@ import argparse
 import torch
 import logging
 from torch.utils.data import DataLoader
-from transformers import CLIPProcessor
+from transformers import AutoProcessor
 
 from data_loader.screenspot import ScreenspotDataset
 from models.agent import InfoMaxAgent
@@ -31,10 +31,9 @@ def main():
     
     # 1. Setup Data
     logger.info("Initializing Dataset...")
-    # Using CLIPProcessor for transform if we want consistent image norm, 
-    # but Dataset currently uses default ToTensor if no transform passed.
-    # To be precise, we should use CLIP's image processor.
-    processor = CLIPProcessor.from_pretrained(args.model_name)
+    # Using AutoProcessor for transform to handle diverse models (CLIP, SigLIP)
+    # This ensures correct image sizing (e.g. 512x512 for SigLIP)
+    processor = AutoProcessor.from_pretrained(args.model_name)
     def transform(image):
         # CLIP inputs: pixel_values
         inputs = processor(images=image, return_tensors="pt")

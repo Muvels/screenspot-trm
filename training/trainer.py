@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 import wandb
 import tqdm
 import logging
-from transformers import CLIPProcessor
+from transformers import AutoProcessor
 from typing import Optional, Dict
 
 from models.agent import InfoMaxAgent
@@ -59,7 +59,7 @@ class Trainer:
             else:
                 # Fallback: Tokenize on fly (CACHE THE PROCESSOR!)
                 if not hasattr(self, "_processor"):
-                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
+                    self._processor = AutoProcessor.from_pretrained(self.agent.encoder.model_name)
                     
                 instructions = batch["instruction"]
                 text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
@@ -115,7 +115,7 @@ class Trainer:
                 attn_mask = batch["attention_mask"].to(self.device)
             else:
                  if not hasattr(self, "_processor"):
-                    self._processor = CLIPProcessor.from_pretrained(self.agent.encoder.model_name)
+                    self._processor = AutoProcessor.from_pretrained(self.agent.encoder.model_name)
                     
                  instructions = batch["instruction"]
                  text_inputs = self._processor(text=list(instructions), return_tensors="pt", padding=True, truncation=True).to(self.device)
