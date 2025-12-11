@@ -49,7 +49,7 @@ class TinyRecursiveModel(nn.Module):
         num_heads: Number of attention heads.
         recursion_depth: Default number of recursion steps T.
     """
-    def __init__(self, hidden_size: int, num_heads: int, num_layers: int = 1, recursion_depth: int = 5):
+    def __init__(self, hidden_size: int, num_heads: int, num_layers: int = 2, recursion_depth: int = 6):
         super().__init__()
         self.hidden_size = hidden_size
         self.recursion_depth = recursion_depth
@@ -78,16 +78,21 @@ class TinyRecursiveModel(nn.Module):
         z = context # Initialize state with context
         
         # Recursion Loop with FULL Gradient Flow
+        # We collect all states for Deep Supervision
+        all_states = []
+        
         for t in range(steps):
             # Apply blocks
             for block in self.blocks:
                 z = block(z)
+            all_states.append(z)
                 
-        return z
+        # Stack: (B, Steps, SeqLen, Hidden)
+        return torch.stack(all_states, dim=1)
 
 if __name__ == "__main__":
     # Test
-    model = TinyRecursiveModel(hidden_size=512, num_heads=8, recursion_depth=3)
+    model = TinyRecursiveModel(hidden_size=512, num_heads=8, recursion_depth=6)
     dummy_input = torch.randn(2, 50, 512)
     output = model(dummy_input)
     print("Output shape:", output.shape)

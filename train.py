@@ -60,8 +60,8 @@ def main():
     
     # 2. Setup Agent
     logger.info("Initializing Agent...")
-    logger.info("Initializing Agent...")
     agent = InfoMaxAgent(vision_text_model=args.model_name)
+    logger.info("Agent initialized with recursion depth: {}".format(agent.core.recursion_depth))
     
     if args.resume_from:
         logger.info(f"Resuming from checkpoint: {args.resume_from}")

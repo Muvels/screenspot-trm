@@ -12,16 +12,23 @@ def compute_iou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
     Returns:
         iou: (B, )
     """
+    # Ensure coordinates are ordered (x1 < x2, y1 < y2) for both boxes
+    b1_x1, b1_x2 = torch.min(box1[:, 0], box1[:, 2]), torch.max(box1[:, 0], box1[:, 2])
+    b1_y1, b1_y2 = torch.min(box1[:, 1], box1[:, 3]), torch.max(box1[:, 1], box1[:, 3])
+    
+    b2_x1, b2_x2 = torch.min(box2[:, 0], box2[:, 2]), torch.max(box2[:, 0], box2[:, 2])
+    b2_y1, b2_y2 = torch.min(box2[:, 1], box2[:, 3]), torch.max(box2[:, 1], box2[:, 3])
+    
     # Intersection
-    x1 = torch.max(box1[:, 0], box2[:, 0])
-    y1 = torch.max(box1[:, 1], box2[:, 1])
-    x2 = torch.min(box1[:, 2], box2[:, 2])
-    y2 = torch.min(box1[:, 3], box2[:, 3])
+    x1 = torch.max(b1_x1, b2_x1)
+    y1 = torch.max(b1_y1, b2_y1)
+    x2 = torch.min(b1_x2, b2_x2)
+    y2 = torch.min(b1_y2, b2_y2)
     
     intersection_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
     
-    box1_area = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    box2_area = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    box1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
     
     union_area = box1_area + box2_area - intersection_area + 1e-6
     
@@ -32,25 +39,32 @@ def compute_giou(box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
     Generalized IoU: IoU - (C - U) / C
     where C is the smallest enclosing box.
     """
+    # Ensure coordinates are ordered
+    b1_x1, b1_x2 = torch.min(box1[:, 0], box1[:, 2]), torch.max(box1[:, 0], box1[:, 2])
+    b1_y1, b1_y2 = torch.min(box1[:, 1], box1[:, 3]), torch.max(box1[:, 1], box1[:, 3])
+    
+    b2_x1, b2_x2 = torch.min(box2[:, 0], box2[:, 2]), torch.max(box2[:, 0], box2[:, 2])
+    b2_y1, b2_y2 = torch.min(box2[:, 1], box2[:, 3]), torch.max(box2[:, 1], box2[:, 3])
+    
     # Intersection
-    x1 = torch.max(box1[:, 0], box2[:, 0])
-    y1 = torch.max(box1[:, 1], box2[:, 1])
-    x2 = torch.min(box1[:, 2], box2[:, 2])
-    y2 = torch.min(box1[:, 3], box2[:, 3])
+    x1 = torch.max(b1_x1, b2_x1)
+    y1 = torch.max(b1_y1, b2_y1)
+    x2 = torch.min(b1_x2, b2_x2)
+    y2 = torch.min(b1_y2, b2_y2)
     
     intersection_area = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
     
-    box1_area = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    box2_area = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    box1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
     
     union_area = box1_area + box2_area - intersection_area + 1e-6
     iou = intersection_area / union_area
     
     # Enclosing Box
-    cX1 = torch.min(box1[:, 0], box2[:, 0])
-    cY1 = torch.min(box1[:, 1], box2[:, 1])
-    cX2 = torch.max(box1[:, 2], box2[:, 2])
-    cY2 = torch.max(box1[:, 3], box2[:, 3])
+    cX1 = torch.min(b1_x1, b2_x1)
+    cY1 = torch.min(b1_y1, b2_y1)
+    cX2 = torch.max(b1_x2, b2_x2)
+    cY2 = torch.max(b1_y2, b2_y2)
     
     c_area = (cX2 - cX1) * (cY2 - cY1) + 1e-6
     

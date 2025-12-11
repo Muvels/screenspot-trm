@@ -18,8 +18,8 @@ class InfoMaxAgent(nn.Module):
     def __init__(self, 
                  vision_text_model: str = "openai/clip-vit-base-patch32", 
                  hidden_size: int = 512, 
-                 trm_layers: int = 1,
-                 trm_depth: int = 3):
+                 trm_layers: int = 2,
+                 trm_depth: int = 6):
         super().__init__()
         
         self.encoder = VisionTextEncoder(model_name=vision_text_model, freeze_backbone=True)
@@ -47,36 +47,43 @@ class InfoMaxAgent(nn.Module):
             attention_mask: (B, L)
             
         Returns:
-            bbox: (B, 4)
-            value: (B, 1)
-            final_state: (B, Seq, H)
+            bbox: (B, Steps, 4)
+            value: (B, Steps, 1)
+            final_state: (B, Steps, Seq, H)
         """
         # 1. Encode
         context = self.encoder(pixel_values, input_ids, attention_mask) # (B, Seq, H)
         
         # 2. Recurse
-        final_context_state = self.core(context) # (B, Seq, H)
+        trm_outputs = self.core(context) # (B, Steps, Seq, H)
         
         # 3. Aggregate for Heads
-        # We need a single vector to represent the state.
-        # Options:
-        # - Max Pool over sequence
-        # - Mean Pool over sequence
-        # - Specific Token (e.g. first token if we had a CLS)
-        # Since fusion is concatenation of [Img, Txt], doing Mean Pool or Max Pool over the whole sequence is reasonable.
-        # Let's do Mean Pool for now.
+        # We need to process each step.
+        # Flatten steps into batch dimension for efficiency or loop.
+        # Shape: (B, Steps, Seq, H) -> (B * Steps, Seq, H)
+        B_size, Steps, Seq, H = trm_outputs.shape
+        trm_flat = trm_outputs.view(B_size * Steps, Seq, H)
         
-        state_vec = final_context_state.mean(dim=1) # (B, H)
+        # Aggregate (Mean Pool)
+        state_vec_flat = trm_flat.mean(dim=1) # (B * Steps, H)
         
         # 4. Heads
-        bbox = self.policy_head(state_vec)
-        value = self.value_head(state_vec)
+        bbox_flat = self.policy_head(state_vec_flat) # (B * Steps, 4)
+        value_flat = self.value_head(state_vec_flat) # (B * Steps, 1)
         
-        return bbox, value, final_context_state
+        # Reshape back to (B, Steps, ...)
+        bbox = bbox_flat.view(B_size, Steps, 4)
+        value = value_flat.view(B_size, Steps, 1)
+        
+        # For compatibility, if we just want "inference" output, we might take the last one.
+        # But for training we return all.
+        # Let the trainer handle selecting the last one for inference/metrics.
+        
+        return bbox, value, trm_outputs
 
 if __name__ == "__main__":
     # Test
-    agent = InfoMaxAgent(trm_depth=2)
+    agent = InfoMaxAgent(trm_depth=6, trm_layers=2)
     B = 2
     img = torch.randn(B, 3, 224, 224)
     txt = torch.randint(0, 1000, (B, 10))
