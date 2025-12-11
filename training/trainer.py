@@ -22,7 +22,7 @@ class Trainer:
                  train_loader: DataLoader, 
                  val_loader: Optional[DataLoader] = None,
                  lr: float = 1e-4,
-                 device: str = "cuda" if torch.cuda.is_available() else "cpu",
+                 device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
                  use_wandb: bool = False):
                  
         self.agent = agent.to(device)

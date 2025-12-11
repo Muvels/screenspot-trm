@@ -14,3 +14,4 @@ samples/
 ExampleTinyRecursiveModels/
 .DS_Store
 wandb/
+checkpoint_*
