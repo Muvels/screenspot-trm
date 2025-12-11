@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit dataset size for debugging")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for data loading")
     
     args = parser.parse_args()
     
@@ -55,8 +56,8 @@ def main():
     val_size = len(dataset) - train_size
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0) # workers=0 for simplicity
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers) 
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     
     # 2. Setup Agent
     logger.info("Initializing Agent...")
