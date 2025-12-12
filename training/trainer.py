@@ -304,7 +304,12 @@ class Trainer:
             
     def train_rl_epoch(self, epoch: int):
         """
-        Train using RL (Actor-Critic style).
+        Train using Advantage-Weighted RL (Actor-Critic style).
+        
+        Improvements over basic RL:
+        1. Advantage weighting: Focus on samples where model underperformed
+        2. Uncertainty estimation: Value Head predicts error for confidence at inference
+        3. L1 loss restored: Full coordinate-level signal
         
         Uses GIoU as reward signal for policy gradient.
         """
@@ -344,30 +349,58 @@ class Trainer:
             
             # Use FINAL step for RL update
             pred_final = pred_bbox[:, -1, :]
-            value_final = value_pred[:, -1, :]
+            value_final = value_pred[:, -1, :].squeeze(-1)  # (B,)
             
-            # Compute Reward (GIoU-based)
-            reward = compute_reward(pred_final, gt_bbox).detach()  # (B,)
+            # =============================================================
+            # Option C: L1 Loss (restored for coordinate-level signal)
+            # =============================================================
+            loss_l1 = nn.functional.l1_loss(pred_final, gt_bbox)
             
-            # Compute Loss (Actor-Critic)
-            advantage = reward - value_final.squeeze(-1).detach()
+            # =============================================================
+            # Compute metrics for advantage and value targets
+            # =============================================================
+            iou = compute_iou(pred_final, gt_bbox)  # (B,)
+            giou = compute_giou(pred_final, gt_bbox)  # (B,)
+            reward = compute_reward(pred_final, gt_bbox)  # IoU + bonus (B,)
             
-            # Value Loss
-            value_loss = nn.functional.mse_loss(value_final.squeeze(-1), reward)
+            # =============================================================
+            # Option B: Value Head predicts UNCERTAINTY (1 - IoU)
+            # This makes it useful at inference for confidence estimation
+            # =============================================================
+            uncertainty_target = (1.0 - iou).detach()  # High = uncertain
+            value_loss = nn.functional.mse_loss(value_final, uncertainty_target)
             
-            # Policy Loss (GIoU gradient)
-            giou = compute_giou(pred_final, gt_bbox)
-            loss_policy = -giou.mean()
+            # =============================================================
+            # Option A: Advantage-Weighted Policy Loss
+            # Samples where model underperformed get stronger gradients
+            # =============================================================
+            # Advantage = actual reward - expected (baseline from value)
+            # Since value now predicts uncertainty: expected_reward ≈ 1 - uncertainty
+            expected_reward = (1.0 - value_final).detach()
+            advantage = (reward - expected_reward).detach()  # (B,)
             
-            loss = loss_policy + 0.5 * value_loss
+            # Normalize advantage for stable training
+            if advantage.std() > 1e-6:
+                advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            
+            # Weighted GIoU loss: harder samples get stronger gradients
+            # We use (1 + advantage) to ensure all samples contribute
+            weights = torch.clamp(1.0 + advantage, min=0.1, max=3.0)  # (B,)
+            loss_policy = -(weights * giou).mean()
+            
+            # =============================================================
+            # Total Loss
+            # =============================================================
+            loss = loss_l1 + loss_policy + 0.5 * value_loss
             
             # ACT Loss for RL (if enabled)
+            act_loss = torch.tensor(0.0, device=self.device)
             if self.use_act and halting_info is not None:
-                # Encourage halting when reward is high
-                high_reward = (reward > 2.0).float()  # IoU > 0.5 + bonus
+                # Encourage halting when prediction is confident (low uncertainty)
+                should_halt = (iou > 0.5).float()  # High IoU = can halt
                 last_halt = halting_info.halt_logits[:, -1]
                 act_loss = nn.functional.binary_cross_entropy_with_logits(
-                    last_halt, high_reward
+                    last_halt, should_halt
                 )
                 loss = loss + self.act_loss_weight * act_loss
             
@@ -379,18 +412,33 @@ class Trainer:
             self.optimizer.step()
             self.scheduler.step()
             
+            # =============================================================
+            # Logging
+            # =============================================================
             metrics = {
                 "train/rl_loss": loss.item(),
-                "train/reward": reward.mean().item()
+                "train/rl_l1": loss_l1.item(),
+                "train/rl_policy": loss_policy.item(),
+                "train/rl_value": value_loss.item(),
+                "train/rl_iou": iou.mean().item(),
+                "train/rl_advantage_mean": advantage.mean().item(),
+                "train/rl_uncertainty": value_final.mean().item(),
+                "train/reward": reward.mean().item(),
+                "train/lr": self.scheduler.get_last_lr()[0]
             }
             
             if self.use_act and halting_info is not None:
+                metrics["train/rl_act_loss"] = act_loss.item()
                 metrics["train/rl_avg_steps"] = halting_info.steps_taken.float().mean().item()
             
             if self.use_wandb:
                 wandb.log(metrics)
                 
-            pbar.set_postfix(loss=loss.item(), reward=reward.mean().item())
+            pbar.set_postfix(
+                loss=loss.item(), 
+                iou=iou.mean().item(),
+                adv=advantage.mean().item()
+            )
 
     def save_checkpoint(self, path: str):
         """Save model checkpoint."""

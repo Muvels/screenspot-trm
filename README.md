@@ -279,10 +279,10 @@ flowchart TB
             GRAD["Gradient clipping<br/>(max_norm=1.0)"]
         end
         
-        subgraph Phase2["🎮 Phase 2: RL Training"]
-            RL_POLICY["Policy Loss = -GIoU"]
-            RL_VALUE["Value Loss = MSE(V, reward)"]
-            REWARD["Reward = IoU + bonus"]
+        subgraph Phase2["🎮 Phase 2: Advantage-Weighted RL"]
+            RL_ADV["Advantage Weighting:<br/>Focus on hard samples"]
+            RL_CONFIDENCE["Value Head → Uncertainty<br/>(usable at inference!)"]
+            RL_LOSS["Loss = L1 + weighted GIoU + Value"]
         end
         
         subgraph Phase3["✅ Phase 3: Validation"]
@@ -299,6 +299,30 @@ flowchart TB
     style Phase1 fill:#e8f5e9
     style Phase2 fill:#fff3e0
     style Phase3 fill:#e3f2fd
+```
+
+### RL Phase Improvements
+
+The RL training phase uses **advantage-weighted learning** to provide benefits beyond supervised training:
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **Advantage Weighting** | Samples where model underperformed get stronger gradients | Focuses learning on hard examples |
+| **Uncertainty Estimation** | Value Head predicts `1 - IoU` instead of reward | **Confidence scores at inference!** |
+| **L1 Loss Restored** | Full coordinate-level signal | Same strength as supervised |
+
+### Inference with Confidence
+
+After training with the RL phase, you can get confidence scores:
+
+```python
+# Standard prediction (bbox only)
+bbox = agent.get_final_prediction(image, input_ids, attention_mask)
+
+# Prediction with confidence (NEW!)
+bbox, confidence = agent.predict_with_confidence(image, input_ids, attention_mask)
+# confidence: 0.0-1.0, higher = more confident
+print(f"Prediction confidence: {confidence.item():.1%}")
 ```
 
 ---

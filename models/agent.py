@@ -227,6 +227,43 @@ class InfoMaxAgent(nn.Module):
         else:
             # Use the last step
             return bbox[:, -1, :]
+    
+    def predict_with_confidence(
+        self, 
+        pixel_values: torch.Tensor, 
+        input_ids: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get bounding box prediction WITH confidence score (for inference).
+        
+        The Value Head is trained to predict uncertainty (1 - IoU) during RL,
+        so confidence = 1 - value output.
+        
+        Returns:
+            bbox: (B, 4) - Final predicted bounding boxes
+            confidence: (B,) - Confidence scores (0-1, higher = more confident)
+        """
+        bbox, value, _, halting_info = self.forward(pixel_values, input_ids, attention_mask)
+        
+        if halting_info is not None:
+            # Use the step at which each sample halted
+            B = bbox.shape[0]
+            final_bbox = torch.zeros(B, 4, device=bbox.device)
+            final_value = torch.zeros(B, device=bbox.device)
+            for i in range(B):
+                step_idx = halting_info.steps_taken[i] - 1  # 0-indexed
+                final_bbox[i] = bbox[i, step_idx]
+                final_value[i] = value[i, step_idx, 0]
+            
+            # Convert uncertainty to confidence
+            confidence = torch.clamp(1.0 - final_value, min=0.0, max=1.0)
+            return final_bbox, confidence
+        else:
+            # Use the last step
+            final_value = value[:, -1, 0]  # (B,)
+            confidence = torch.clamp(1.0 - final_value, min=0.0, max=1.0)
+            return bbox[:, -1, :], confidence
 
 
 # =============================================================================
