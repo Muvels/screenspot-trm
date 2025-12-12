@@ -22,6 +22,7 @@ class Trainer:
                  train_loader: DataLoader, 
                  val_loader: Optional[DataLoader] = None,
                  lr: float = 1e-4,
+                 num_epochs: int = 1,
                  device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
                  use_wandb: bool = False):
                  
@@ -33,11 +34,10 @@ class Trainer:
         
         self.optimizer = optim.AdamW(self.agent.parameters(), lr=lr)
         
-        # Scheduler: Use length of loader * default epochs (e.g. 1)
-        # Better: T_max = steps per epoch. We step scheduler every batch.
-        # If we want it to reset every epoch, T_max = len(train_loader).
+        # Scheduler: T_max = total_steps across all epochs
         steps_per_epoch = len(train_loader) if train_loader is not None else 1000
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=steps_per_epoch)
+        total_steps = steps_per_epoch * num_epochs
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps)
         
         self.step = 0
         

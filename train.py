@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to generate")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit dataset size for debugging")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--unfreeze_backbone", action="store_true", help="Unfreeze vision encoder")
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers for data loading")
     
     args = parser.parse_args()
@@ -61,7 +62,7 @@ def main():
     
     # 2. Setup Agent
     logger.info("Initializing Agent...")
-    agent = InfoMaxAgent(vision_text_model=args.model_name)
+    agent = InfoMaxAgent(vision_text_model=args.model_name, freeze_backbone=not args.unfreeze_backbone)
     logger.info("Agent initialized with recursion depth: {}".format(agent.core.recursion_depth))
     
     if args.resume_from:
@@ -75,7 +76,7 @@ def main():
             return
     
     # 3. Setup Trainer
-    trainer = Trainer(agent, train_loader, val_loader, lr=args.lr, use_wandb=args.use_wandb)
+    trainer = Trainer(agent, train_loader, val_loader, lr=args.lr, num_epochs=args.epochs, use_wandb=args.use_wandb)
     
     if args.mode == "train":
         logger.info("Starting Training...")

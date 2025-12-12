@@ -19,10 +19,11 @@ class InfoMaxAgent(nn.Module):
                  vision_text_model: str = "openai/clip-vit-base-patch32", 
                  hidden_size: int = 512, 
                  trm_layers: int = 2,
-                 trm_depth: int = 6):
+                 trm_depth: int = 6,
+                 freeze_backbone: bool = True):
         super().__init__()
         
-        self.encoder = VisionTextEncoder(model_name=vision_text_model, freeze_backbone=True)
+        self.encoder = VisionTextEncoder(model_name=vision_text_model, freeze_backbone=freeze_backbone)
         # Note: encoding output dim is configurable in VisionTextEncoder, defaults to 512
         if self.encoder.out_dim != hidden_size:
             # We could add a projection here or change encoder config
