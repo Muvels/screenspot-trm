@@ -116,19 +116,52 @@ def process_uground_example(example: dict) -> list[dict]:
     return results
 
 
-def get_parquet_schema():
-    """Get the schema matching screenspot_training.parquet"""
-    return pa.schema([
-        ('image', pa.struct([
-            ('bytes', pa.binary()),
-            ('path', pa.string()),
-        ])),
-        ('task', pa.string()),
-        ('image_width', pa.int64()),
-        ('image_height', pa.int64()),
-        ('bbox', pa.list_(pa.float32())),
-    ])
+def get_parquet_schema(existing_path: Path):
+    """Read schema from existing parquet file to ensure compatibility"""
+    pf = pq.ParquetFile(existing_path)
+    return pf.schema_arrow
 
+
+def batch_to_table(batch_rows: list[dict], schema: pa.Schema) -> pa.Table:
+    """
+    Convert a list of row dicts to an Arrow table with the correct schema.
+    Handles fixed_size_list for bbox column.
+    """
+    if not batch_rows:
+        return pa.Table.from_pylist([], schema=schema)
+    
+    # Build each column separately to ensure correct types
+    images = [row['image'] for row in batch_rows]
+    tasks = [row['task'] for row in batch_rows]
+    widths = [row['image_width'] for row in batch_rows]
+    heights = [row['image_height'] for row in batch_rows]
+    bboxes = [row['bbox'] for row in batch_rows]
+    
+    # Get the bbox type from schema
+    bbox_type = schema.field('bbox').type
+    
+    # Create arrays
+    image_array = pa.array(images, type=schema.field('image').type)
+    task_array = pa.array(tasks, type=pa.string())
+    width_array = pa.array(widths, type=pa.int64())
+    height_array = pa.array(heights, type=pa.int64())
+    
+    # Handle bbox - need to create fixed_size_list if that's what schema expects
+    if pa.types.is_fixed_size_list(bbox_type):
+        # Create as fixed_size_list
+        flat_values = []
+        for bbox in bboxes:
+            flat_values.extend(bbox)
+        value_array = pa.array(flat_values, type=pa.float32())
+        bbox_array = pa.FixedSizeListArray.from_arrays(value_array, 4)
+    else:
+        # Regular list
+        bbox_array = pa.array(bboxes, type=bbox_type)
+    
+    return pa.Table.from_arrays(
+        [image_array, task_array, width_array, height_array, bbox_array],
+        names=['image', 'task', 'image_width', 'image_height', 'bbox']
+    )
 
 def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode: bool, limit: int | None):
     """
@@ -137,7 +170,7 @@ def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode
     """
     BATCH_SIZE = 500  # Process this many UGround rows before writing
     
-    schema = get_parquet_schema()
+    schema = get_parquet_schema(existing_path)
     
     # First, copy existing data to the new output file
     print(f"Copying existing dataset to output...")
@@ -211,8 +244,8 @@ def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode
             
             # Write batch when it's large enough
             if len(batch_rows) >= BATCH_SIZE * 10:  # ~5000 processed rows per write
-                # Convert to Arrow table
-                table = pa.Table.from_pylist(batch_rows, schema=schema)
+                # Convert to Arrow table using proper schema handling
+                table = batch_to_table(batch_rows, schema)
                 writer.write_table(table)
                 processed_count += len(batch_rows)
                 batch_rows = []
@@ -222,7 +255,7 @@ def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode
         
         # Write remaining rows
         if batch_rows:
-            table = pa.Table.from_pylist(batch_rows, schema=schema)
+            table = batch_to_table(batch_rows, schema)
             writer.write_table(table)
             processed_count += len(batch_rows)
     
