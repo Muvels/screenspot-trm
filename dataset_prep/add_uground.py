@@ -6,22 +6,70 @@ The UGround dataset has conversations with human prompts and GPT bbox responses.
 Each human/gpt pair becomes a separate row in our dataset.
 
 Uses STREAMING mode to avoid downloading the full 300GB+ dataset.
+Supports checkpointing for resumable processing.
+Graceful stop with 's' key, disk space checking.
 
 Usage:
-    uv run python add_uground.py           # Stream full dataset and process
-    uv run python add_uground.py --test    # Use local shard_0000.parquet for testing
-    uv run python add_uground.py --limit 10000  # Process only first 10000 rows
+    uv run python add_uground.py --output merged.parquet          # Stream full dataset
+    uv run python add_uground.py --test --output test.parquet     # Use local shard for testing
+    uv run python add_uground.py --output merged.parquet --resume # Resume from checkpoint
+
+Press 's' + Enter during processing to gracefully stop after the current batch.
 """
 
 import argparse
 import json
+import os
 import re
+import select
+import shutil
+import sys
+import threading
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+# Global flag for graceful stop
+_stop_requested = False
+_input_lock = threading.Lock()
+
+
+def check_for_stop_input():
+    """Background thread to check for 's' input."""
+    global _stop_requested
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if line.strip().lower() == 's':
+                with _input_lock:
+                    _stop_requested = True
+                print("\n[!] Stop requested. Will save and exit after current batch...")
+                break
+        except:
+            break
+
+
+def is_stop_requested() -> bool:
+    """Check if user requested stop."""
+    with _input_lock:
+        return _stop_requested
+
+
+def check_disk_space(path: Path, min_gb: float = 5.0) -> tuple[bool, float]:
+    """
+    Check if there's enough disk space.
+    Returns (has_enough_space, available_gb)
+    """
+    try:
+        stat = shutil.disk_usage(path.parent if path.parent.exists() else Path.cwd())
+        available_gb = stat.free / (1024 ** 3)
+        return available_gb >= min_gb, available_gb
+    except Exception:
+        return True, -1  # Assume OK if we can't check
 
 
 def parse_bbox_string(bbox_str: str) -> tuple[int, int, int, int] | None:
@@ -38,24 +86,18 @@ def parse_bbox_string(bbox_str: str) -> tuple[int, int, int, int] | None:
 def normalize_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> list[float]:
     """
     Normalize absolute pixel bbox to 0-1 range and clamp values.
-    Input: (x1, y1, x2, y2) in pixels
-    Output: list of floats [x1/width, y1/height, x2/width, y2/height], clamped to [0, 1]
     """
     x1, y1, x2, y2 = bbox
-    normalized = [
+    return [
         max(0.0, min(1.0, x1 / width)),
         max(0.0, min(1.0, y1 / height)),
         max(0.0, min(1.0, x2 / width)),
         max(0.0, min(1.0, y2 / height)),
     ]
-    return normalized
 
 
 def parse_conversations(conversations_json: str) -> list[tuple[str, str]]:
-    """
-    Parse conversations JSON and extract (human_prompt, gpt_bbox) pairs.
-    Returns list of tuples.
-    """
+    """Parse conversations JSON and extract (human_prompt, gpt_bbox) pairs."""
     try:
         conversations = json.loads(conversations_json) if isinstance(conversations_json, str) else conversations_json
     except json.JSONDecodeError:
@@ -68,9 +110,7 @@ def parse_conversations(conversations_json: str) -> list[tuple[str, str]]:
         next_item = conversations[i + 1]
         
         if current.get('from') == 'human' and next_item.get('from') == 'gpt':
-            human_value = current.get('value', '')
-            gpt_value = next_item.get('value', '')
-            pairs.append((human_value, gpt_value))
+            pairs.append((current.get('value', ''), next_item.get('value', '')))
             i += 2
         else:
             i += 1
@@ -79,83 +119,64 @@ def parse_conversations(conversations_json: str) -> list[tuple[str, str]]:
 
 
 def process_uground_example(example: dict) -> list[dict]:
-    """
-    Process a single example from the UGround dataset.
-    Returns a list of dicts, one for each human/gpt pair in the conversations.
-    """
+    """Process a single example from the UGround dataset."""
     width = int(example['width'])
     height = int(example['height'])
     image_bytes = example['image']
     conversations_json = example['conversations']
     
-    # Parse conversations to get human/gpt pairs
     pairs = parse_conversations(conversations_json)
-    
-    # Convert image bytes once for all pairs
     image_dict = {'bytes': image_bytes, 'path': None}
     
     results = []
     for human_prompt, gpt_bbox_str in pairs:
-        # Parse the bbox string
         bbox_tuple = parse_bbox_string(gpt_bbox_str)
         if bbox_tuple is None:
             continue
         
-        # Normalize the bbox (clamped to [0, 1])
         normalized_bbox = normalize_bbox(bbox_tuple, width, height)
-        
-        result = {
+        results.append({
             'image': image_dict,
             'task': human_prompt,
             'image_width': width,
             'image_height': height,
             'bbox': normalized_bbox,
-        }
-        results.append(result)
+        })
     
     return results
 
 
 def get_parquet_schema(existing_path: Path):
-    """Read schema from existing parquet file to ensure compatibility"""
+    """Read schema from existing parquet file."""
     pf = pq.ParquetFile(existing_path)
     return pf.schema_arrow
 
 
 def batch_to_table(batch_rows: list[dict], schema: pa.Schema) -> pa.Table:
-    """
-    Convert a list of row dicts to an Arrow table with the correct schema.
-    Handles fixed_size_list for bbox column.
-    """
+    """Convert a list of row dicts to an Arrow table with the correct schema."""
     if not batch_rows:
         return pa.Table.from_pylist([], schema=schema)
     
-    # Build each column separately to ensure correct types
     images = [row['image'] for row in batch_rows]
     tasks = [row['task'] for row in batch_rows]
     widths = [row['image_width'] for row in batch_rows]
     heights = [row['image_height'] for row in batch_rows]
     bboxes = [row['bbox'] for row in batch_rows]
     
-    # Get the bbox type from schema
     bbox_type = schema.field('bbox').type
     
-    # Create arrays
     image_array = pa.array(images, type=schema.field('image').type)
     task_array = pa.array(tasks, type=pa.string())
     width_array = pa.array(widths, type=pa.int64())
     height_array = pa.array(heights, type=pa.int64())
     
-    # Handle bbox - need to create fixed_size_list if that's what schema expects
     if pa.types.is_fixed_size_list(bbox_type):
-        # Create as fixed_size_list
         flat_values = []
         for bbox in bboxes:
             flat_values.extend(bbox)
         value_array = pa.array(flat_values, type=pa.float32())
         bbox_array = pa.FixedSizeListArray.from_arrays(value_array, 4)
     else:
-        # Regular list
         bbox_array = pa.array(bboxes, type=bbox_type)
     
     return pa.Table.from_arrays(
@@ -163,40 +184,65 @@ def batch_to_table(batch_rows: list[dict], schema: pa.Schema) -> pa.Table:
         names=['image', 'task', 'image_width', 'image_height', 'bbox']
     )
 
-def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode: bool, limit: int | None):
+
+def load_checkpoint(checkpoint_path: Path) -> dict:
+    """Load checkpoint data."""
+    if checkpoint_path.exists():
+        with open(checkpoint_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_checkpoint(checkpoint_path: Path, source_count: int, processed_count: int):
+    """Save checkpoint with current progress."""
+    with open(checkpoint_path, 'w') as f:
+        json.dump({
+            'source_rows_processed': source_count,
+            'task_bbox_pairs_written': processed_count,
+        }, f)
+
+
+def stream_and_process_uground(
+    output_path: Path, 
+    existing_path: Path, 
+    test_mode: bool, 
+    limit: int | None,
+    resume: bool = False,
+    min_disk_gb: float = 5.0,
+):
     """
     Stream the UGround dataset and write processed rows incrementally to parquet.
-    Uses batched writing to avoid memory issues.
+    Supports: checkpointing, graceful stop, disk space checking.
     """
-    BATCH_SIZE = 500  # Process this many UGround rows before writing
+    BATCH_SIZE = 500
     
     schema = get_parquet_schema(existing_path)
+    checkpoint_path = output_path.with_suffix('.checkpoint.json')
     
-    # First, copy existing data to the new output file
-    print(f"Copying existing dataset to output...")
-    if existing_path != output_path:
-        # Read and write in chunks to avoid memory issues
-        existing_pf = pq.ParquetFile(existing_path)
-        with pq.ParquetWriter(output_path, schema) as writer:
-            for i in range(existing_pf.metadata.num_row_groups):
-                table = existing_pf.read_row_group(i)
-                writer.write_table(table)
-                if (i + 1) % 10 == 0:
-                    print(f"  Copied {i + 1}/{existing_pf.metadata.num_row_groups} row groups...")
-        existing_rows = existing_pf.metadata.num_rows
-        print(f"Copied {existing_rows} existing rows")
-    else:
-        # Output is same as input, we'll need to write to temp and rename
-        raise ValueError("Output path cannot be the same as input when streaming. Use --output to specify a different path.")
+    # Start input listener thread
+    print("Press 's' + Enter at any time to gracefully stop and save progress.")
+    input_thread = threading.Thread(target=check_for_stop_input, daemon=True)
+    input_thread.start()
     
-    # Now stream and append UGround data
+    # Check for resume
+    skip_rows = 0
+    checkpoint_data = load_checkpoint(checkpoint_path)
+    if resume and checkpoint_data:
+        skip_rows = checkpoint_data.get('source_rows_processed', 0)
+        if skip_rows > 0:
+            print(f"Resuming from checkpoint: skipping first {skip_rows} source rows")
+            if not output_path.exists():
+                print("ERROR: Checkpoint exists but output file not found.")
+                print("Delete the checkpoint file to start fresh, or restore the output file.")
+                return 0, 0
+    
+    # Load source data
     if test_mode:
         print("Test mode: Loading local shard_0000.parquet...")
         shard_path = Path(__file__).parent / "shard_0000.parquet"
         if not shard_path.exists():
             raise FileNotFoundError(f"Test shard not found: {shard_path}")
         
-        # Read the shard and iterate
         shard_df = pd.read_parquet(shard_path)
         
         def row_iterator():
@@ -210,28 +256,34 @@ def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode
         from datasets import load_dataset
         ds = load_dataset("osunlp/UGround-V1-Data-Box", split="train", streaming=True)
         source_iter = iter(ds)
-        total_source_rows = None  # Unknown in streaming mode
+        total_source_rows = None
     
-    # Process in batches and append to parquet
     processed_count = 0
     source_count = 0
     batch_rows = []
+    existing_rows = 0
+    stopped_early = False
     
     print("Processing UGround dataset (streaming)...")
     
-    # Open the file in append mode
-    with pq.ParquetWriter(output_path, schema, writer_engine_version='V2') as writer:
-        # First write existing data
-        existing_pf = pq.ParquetFile(existing_path)
-        for i in range(existing_pf.metadata.num_row_groups):
-            table = existing_pf.read_row_group(i)
-            writer.write_table(table)
-        existing_rows = existing_pf.metadata.num_rows
-        print(f"Wrote {existing_rows} existing rows")
+    if resume and skip_rows > 0 and output_path.exists():
+        # Resume mode: skip already processed rows, then append
+        print(f"Skipping {skip_rows} already-processed rows...")
+        for _ in range(skip_rows):
+            try:
+                next(source_iter)
+                source_count += 1
+            except StopIteration:
+                print("Reached end of dataset. Nothing more to process.")
+                return 0, 0
         
-        # Now process streaming data
+        print(f"Continuing from row {skip_rows}...")
+        
         for example in source_iter:
             if limit and source_count >= limit:
+                break
+            if is_stop_requested():
+                stopped_early = True
                 break
             
             try:
@@ -242,22 +294,100 @@ def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode
             
             source_count += 1
             
-            # Write batch when it's large enough
-            if len(batch_rows) >= BATCH_SIZE * 10:  # ~5000 processed rows per write
-                # Convert to Arrow table using proper schema handling
+            if len(batch_rows) >= BATCH_SIZE * 10:
+                # Check disk space
+                has_space, avail_gb = check_disk_space(output_path, min_disk_gb)
+                if not has_space:
+                    print(f"\n[!] LOW DISK SPACE: {avail_gb:.1f}GB available (need {min_disk_gb}GB)")
+                    print("Saving current progress and stopping...")
+                    stopped_early = True
+                
                 table = batch_to_table(batch_rows, schema)
-                writer.write_table(table)
+                existing_table = pq.read_table(output_path)
+                combined = pa.concat_tables([existing_table, table])
+                pq.write_table(combined, output_path)
+                
                 processed_count += len(batch_rows)
+                save_checkpoint(checkpoint_path, source_count, processed_count)
                 batch_rows = []
                 
                 progress = f"{source_count}/{total_source_rows}" if total_source_rows else f"{source_count}"
-                print(f"  Processed {progress} source rows, {processed_count} task/bbox pairs written...")
+                _, avail_gb = check_disk_space(output_path)
+                print(f"  Processed {progress} rows, {processed_count} pairs | Disk: {avail_gb:.1f}GB free")
+                
+                if stopped_early:
+                    break
         
-        # Write remaining rows
+        # Write remaining
         if batch_rows:
             table = batch_to_table(batch_rows, schema)
-            writer.write_table(table)
+            existing_table = pq.read_table(output_path)
+            combined = pa.concat_tables([existing_table, table])
+            pq.write_table(combined, output_path)
             processed_count += len(batch_rows)
+            save_checkpoint(checkpoint_path, source_count, processed_count)
+    
+    else:
+        # Fresh start
+        with pq.ParquetWriter(output_path, schema) as writer:
+            print(f"Copying existing dataset from {existing_path}...")
+            existing_pf = pq.ParquetFile(existing_path)
+            for i in range(existing_pf.metadata.num_row_groups):
+                table = existing_pf.read_row_group(i)
+                writer.write_table(table)
+                if (i + 1) % 10 == 0:
+                    print(f"  Copied {i + 1}/{existing_pf.metadata.num_row_groups} row groups...")
+            existing_rows = existing_pf.metadata.num_rows
+            print(f"Copied {existing_rows} existing rows")
+            
+            for example in source_iter:
+                if limit and source_count >= limit:
+                    break
+                if is_stop_requested():
+                    stopped_early = True
+                    break
+                
+                try:
+                    rows = process_uground_example(example)
+                    batch_rows.extend(rows)
+                except Exception as e:
+                    print(f"Warning: Error processing row {source_count}: {e}")
+                
+                source_count += 1
+                
+                if len(batch_rows) >= BATCH_SIZE * 10:
+                    # Check disk space
+                    has_space, avail_gb = check_disk_space(output_path, min_disk_gb)
+                    if not has_space:
+                        print(f"\n[!] LOW DISK SPACE: {avail_gb:.1f}GB available")
+                        stopped_early = True
+                    
+                    table = batch_to_table(batch_rows, schema)
+                    writer.write_table(table)
+                    processed_count += len(batch_rows)
+                    save_checkpoint(checkpoint_path, source_count, processed_count)
+                    batch_rows = []
+                    
+                    progress = f"{source_count}/{total_source_rows}" if total_source_rows else f"{source_count}"
+                    _, avail_gb = check_disk_space(output_path)
+                    print(f"  Processed {progress} rows, {processed_count} pairs | Disk: {avail_gb:.1f}GB free")
+                    
+                    if stopped_early:
+                        break
+            
+            if batch_rows:
+                table = batch_to_table(batch_rows, schema)
+                writer.write_table(table)
+                processed_count += len(batch_rows)
+                save_checkpoint(checkpoint_path, source_count, processed_count)
+    
+    # Cleanup or keep checkpoint
+    if stopped_early:
+        print(f"\n[!] Stopped early. Checkpoint saved at {checkpoint_path}")
+        print(f"    Run with --resume to continue.")
+    elif checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Processing complete. Checkpoint removed.")
     
     print(f"\nDone!")
     print(f"  Source rows processed: {source_count}")
@@ -271,26 +401,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process UGround dataset (streaming) and append to screenspot_training.parquet"
     )
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Use local shard_0000.parquet instead of streaming full dataset"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output path for the merged dataset (required to avoid overwriting during streaming)"
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit the number of source rows to process (for testing)"
-    )
+    parser.add_argument("--test", action="store_true", help="Use local shard for testing")
+    parser.add_argument("--output", type=str, required=True, help="Output path for merged dataset")
+    parser.add_argument("--limit", type=int, default=None, help="Limit source rows to process")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--min-disk-gb", type=float, default=5.0, help="Minimum disk space (GB) before stopping")
     args = parser.parse_args()
     
-    # Paths
     script_dir = Path(__file__).parent
     dataset_dir = script_dir.parent / "dataset"
     screenspot_path = dataset_dir / "screenspot_training.parquet"
@@ -299,15 +416,26 @@ def main():
     if not screenspot_path.exists():
         raise FileNotFoundError(f"screenspot_training.parquet not found at {screenspot_path}")
     
+    # Initial disk check
+    has_space, avail_gb = check_disk_space(output_path, args.min_disk_gb)
     print(f"Input: {screenspot_path}")
     print(f"Output: {output_path}")
+    print(f"Disk space: {avail_gb:.1f}GB available (min: {args.min_disk_gb}GB)")
+    if args.resume:
+        print("Resume mode: ON")
     print()
+    
+    if not has_space:
+        print(f"ERROR: Not enough disk space. Need at least {args.min_disk_gb}GB.")
+        return
     
     existing_rows, new_rows = stream_and_process_uground(
         output_path=output_path,
         existing_path=screenspot_path,
         test_mode=args.test,
         limit=args.limit,
+        resume=args.resume,
+        min_disk_gb=args.min_disk_gb,
     )
     
     print(f"\nSummary:")
