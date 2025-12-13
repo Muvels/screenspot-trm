@@ -5,9 +5,12 @@ and append it to the screenspot_training.parquet dataset.
 The UGround dataset has conversations with human prompts and GPT bbox responses.
 Each human/gpt pair becomes a separate row in our dataset.
 
+Uses STREAMING mode to avoid downloading the full 300GB+ dataset.
+
 Usage:
-    uv run python add_uground.py           # Download full dataset and process
+    uv run python add_uground.py           # Stream full dataset and process
     uv run python add_uground.py --test    # Use local shard_0000.parquet for testing
+    uv run python add_uground.py --limit 10000  # Process only first 10000 rows
 """
 
 import argparse
@@ -17,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def parse_bbox_string(bbox_str: str) -> tuple[int, int, int, int] | None:
@@ -24,28 +29,26 @@ def parse_bbox_string(bbox_str: str) -> tuple[int, int, int, int] | None:
     Parse bbox string like '(30, 56, 303, 91)' into tuple of ints.
     Returns None if parsing fails.
     """
-    # Remove parentheses and split by comma
     match = re.match(r'\(?\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)?', bbox_str.strip())
     if match:
         return tuple(int(x) for x in match.groups())
     return None
 
 
-def normalize_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> np.ndarray:
+def normalize_bbox(bbox: tuple[int, int, int, int], width: int, height: int) -> list[float]:
     """
     Normalize absolute pixel bbox to 0-1 range and clamp values.
     Input: (x1, y1, x2, y2) in pixels
-    Output: np.array([x1/width, y1/height, x2/width, y2/height]), clamped to [0, 1]
+    Output: list of floats [x1/width, y1/height, x2/width, y2/height], clamped to [0, 1]
     """
     x1, y1, x2, y2 = bbox
-    normalized = np.array([
-        x1 / width,
-        y1 / height,
-        x2 / width,
-        y2 / height,
-    ], dtype=np.float32)
-    # Clamp to [0, 1] range in case of annotation errors
-    return np.clip(normalized, 0.0, 1.0)
+    normalized = [
+        max(0.0, min(1.0, x1 / width)),
+        max(0.0, min(1.0, y1 / height)),
+        max(0.0, min(1.0, x2 / width)),
+        max(0.0, min(1.0, y2 / height)),
+    ]
+    return normalized
 
 
 def parse_conversations(conversations_json: str) -> list[tuple[str, str]]:
@@ -75,42 +78,32 @@ def parse_conversations(conversations_json: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def convert_image_bytes_to_dict(image_bytes: bytes) -> dict:
+def process_uground_example(example: dict) -> list[dict]:
     """
-    Convert raw image bytes to the format used by screenspot_training.parquet.
-    The screenspot format stores images as dict with 'bytes' and 'path' keys.
-    """
-    return {'bytes': image_bytes, 'path': None}
-
-
-def process_uground_row(row: pd.Series) -> list[dict]:
-    """
-    Process a single row from the UGround dataset.
+    Process a single example from the UGround dataset.
     Returns a list of dicts, one for each human/gpt pair in the conversations.
     """
-    width = int(row['width'])
-    height = int(row['height'])
-    image_bytes = row['image']
-    conversations_json = row['conversations']
+    width = int(example['width'])
+    height = int(example['height'])
+    image_bytes = example['image']
+    conversations_json = example['conversations']
     
     # Parse conversations to get human/gpt pairs
     pairs = parse_conversations(conversations_json)
     
     # Convert image bytes once for all pairs
-    image_dict = convert_image_bytes_to_dict(image_bytes)
+    image_dict = {'bytes': image_bytes, 'path': None}
     
     results = []
     for human_prompt, gpt_bbox_str in pairs:
         # Parse the bbox string
         bbox_tuple = parse_bbox_string(gpt_bbox_str)
         if bbox_tuple is None:
-            # Skip this pair silently (don't spam warnings)
             continue
         
-        # Normalize the bbox (returns numpy array, clamped to [0, 1])
+        # Normalize the bbox (clamped to [0, 1])
         normalized_bbox = normalize_bbox(bbox_tuple, width, height)
         
-        # Create the row in screenspot format
         result = {
             'image': image_dict,
             'task': human_prompt,
@@ -123,39 +116,144 @@ def process_uground_row(row: pd.Series) -> list[dict]:
     return results
 
 
-def load_uground_dataset(test_mode: bool) -> pd.DataFrame:
+def get_parquet_schema():
+    """Get the schema matching screenspot_training.parquet"""
+    return pa.schema([
+        ('image', pa.struct([
+            ('bytes', pa.binary()),
+            ('path', pa.string()),
+        ])),
+        ('task', pa.string()),
+        ('image_width', pa.int64()),
+        ('image_height', pa.int64()),
+        ('bbox', pa.list_(pa.float32())),
+    ])
+
+
+def stream_and_process_uground(output_path: Path, existing_path: Path, test_mode: bool, limit: int | None):
     """
-    Load the UGround dataset.
-    In test mode, uses local shard_0000.parquet.
-    Otherwise, downloads from HuggingFace.
+    Stream the UGround dataset and write processed rows incrementally to parquet.
+    Uses batched writing to avoid memory issues.
     """
+    BATCH_SIZE = 500  # Process this many UGround rows before writing
+    
+    schema = get_parquet_schema()
+    
+    # First, copy existing data to the new output file
+    print(f"Copying existing dataset to output...")
+    if existing_path != output_path:
+        # Read and write in chunks to avoid memory issues
+        existing_pf = pq.ParquetFile(existing_path)
+        with pq.ParquetWriter(output_path, schema) as writer:
+            for i in range(existing_pf.metadata.num_row_groups):
+                table = existing_pf.read_row_group(i)
+                writer.write_table(table)
+                if (i + 1) % 10 == 0:
+                    print(f"  Copied {i + 1}/{existing_pf.metadata.num_row_groups} row groups...")
+        existing_rows = existing_pf.metadata.num_rows
+        print(f"Copied {existing_rows} existing rows")
+    else:
+        # Output is same as input, we'll need to write to temp and rename
+        raise ValueError("Output path cannot be the same as input when streaming. Use --output to specify a different path.")
+    
+    # Now stream and append UGround data
     if test_mode:
         print("Test mode: Loading local shard_0000.parquet...")
         shard_path = Path(__file__).parent / "shard_0000.parquet"
         if not shard_path.exists():
             raise FileNotFoundError(f"Test shard not found: {shard_path}")
-        return pd.read_parquet(shard_path)
+        
+        # Read the shard and iterate
+        shard_df = pd.read_parquet(shard_path)
+        
+        def row_iterator():
+            for idx, row in shard_df.iterrows():
+                yield row.to_dict()
+        
+        total_source_rows = len(shard_df)
+        source_iter = row_iterator()
     else:
-        print("Downloading osunlp/UGround-V1-Data-Box from HuggingFace...")
+        print("Streaming osunlp/UGround-V1-Data-Box from HuggingFace...")
         from datasets import load_dataset
-        ds = load_dataset("osunlp/UGround-V1-Data-Box", split="train")
-        return ds.to_pandas()
+        ds = load_dataset("osunlp/UGround-V1-Data-Box", split="train", streaming=True)
+        source_iter = iter(ds)
+        total_source_rows = None  # Unknown in streaming mode
+    
+    # Process in batches and append to parquet
+    processed_count = 0
+    source_count = 0
+    batch_rows = []
+    
+    print("Processing UGround dataset (streaming)...")
+    
+    # Open the file in append mode
+    with pq.ParquetWriter(output_path, schema, writer_engine_version='V2') as writer:
+        # First write existing data
+        existing_pf = pq.ParquetFile(existing_path)
+        for i in range(existing_pf.metadata.num_row_groups):
+            table = existing_pf.read_row_group(i)
+            writer.write_table(table)
+        existing_rows = existing_pf.metadata.num_rows
+        print(f"Wrote {existing_rows} existing rows")
+        
+        # Now process streaming data
+        for example in source_iter:
+            if limit and source_count >= limit:
+                break
+            
+            try:
+                rows = process_uground_example(example)
+                batch_rows.extend(rows)
+            except Exception as e:
+                print(f"Warning: Error processing row {source_count}: {e}")
+            
+            source_count += 1
+            
+            # Write batch when it's large enough
+            if len(batch_rows) >= BATCH_SIZE * 10:  # ~5000 processed rows per write
+                # Convert to Arrow table
+                table = pa.Table.from_pylist(batch_rows, schema=schema)
+                writer.write_table(table)
+                processed_count += len(batch_rows)
+                batch_rows = []
+                
+                progress = f"{source_count}/{total_source_rows}" if total_source_rows else f"{source_count}"
+                print(f"  Processed {progress} source rows, {processed_count} task/bbox pairs written...")
+        
+        # Write remaining rows
+        if batch_rows:
+            table = pa.Table.from_pylist(batch_rows, schema=schema)
+            writer.write_table(table)
+            processed_count += len(batch_rows)
+    
+    print(f"\nDone!")
+    print(f"  Source rows processed: {source_count}")
+    print(f"  Task/bbox pairs added: {processed_count}")
+    print(f"  Output: {output_path}")
+    
+    return existing_rows, processed_count
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process UGround dataset and append to screenspot_training.parquet"
+        description="Process UGround dataset (streaming) and append to screenspot_training.parquet"
     )
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Use local shard_0000.parquet instead of downloading full dataset"
+        help="Use local shard_0000.parquet instead of streaming full dataset"
     )
     parser.add_argument(
         "--output",
         type=str,
+        required=True,
+        help="Output path for the merged dataset (required to avoid overwriting during streaming)"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
         default=None,
-        help="Output path for the merged dataset (default: overwrite screenspot_training.parquet)"
+        help="Limit the number of source rows to process (for testing)"
     )
     args = parser.parse_args()
     
@@ -163,65 +261,26 @@ def main():
     script_dir = Path(__file__).parent
     dataset_dir = script_dir.parent / "dataset"
     screenspot_path = dataset_dir / "screenspot_training.parquet"
+    output_path = Path(args.output)
     
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = screenspot_path
-    
-    # Load existing screenspot dataset
-    print(f"Loading existing dataset from {screenspot_path}...")
     if not screenspot_path.exists():
         raise FileNotFoundError(f"screenspot_training.parquet not found at {screenspot_path}")
     
-    existing_df = pd.read_parquet(screenspot_path)
-    print(f"Existing dataset: {len(existing_df)} rows")
+    print(f"Input: {screenspot_path}")
+    print(f"Output: {output_path}")
+    print()
     
-    # Load UGround dataset
-    uground_df = load_uground_dataset(args.test)
-    print(f"UGround dataset loaded: {len(uground_df)} rows")
+    existing_rows, new_rows = stream_and_process_uground(
+        output_path=output_path,
+        existing_path=screenspot_path,
+        test_mode=args.test,
+        limit=args.limit,
+    )
     
-    # Process UGround dataset
-    print("Processing UGround dataset...")
-    new_rows = []
-    skipped = 0
-    for idx, row in uground_df.iterrows():
-        try:
-            processed_rows = process_uground_row(row)
-            new_rows.extend(processed_rows)
-        except Exception as e:
-            print(f"Warning: Error processing row {idx}: {e}")
-            skipped += 1
-        
-        # Progress indicator
-        if (idx + 1) % 1000 == 0:
-            print(f"  Processed {idx + 1}/{len(uground_df)} rows...")
-    
-    print(f"Processed {len(new_rows)} task/bbox pairs from UGround dataset")
-    if skipped > 0:
-        print(f"Skipped {skipped} rows due to errors")
-    
-    # Convert to DataFrame
-    new_df = pd.DataFrame(new_rows)
-    
-    # Ensure column order matches
-    new_df = new_df[['image', 'task', 'image_width', 'image_height', 'bbox']]
-    
-    # Append to existing dataset
-    print("Merging datasets...")
-    merged_df = pd.concat([existing_df, new_df], ignore_index=True)
-    print(f"Merged dataset: {len(merged_df)} rows")
-    
-    # Save
-    print(f"Saving to {output_path}...")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged_df.to_parquet(output_path)
-    
-    print(f"\nDone!")
-    print(f"  Original rows: {len(existing_df)}")
-    print(f"  New rows added: {len(new_df)}")
-    print(f"  Total rows: {len(merged_df)}")
-    print(f"  Output: {output_path}")
+    print(f"\nSummary:")
+    print(f"  Original rows: {existing_rows}")
+    print(f"  New rows added: {new_rows}")
+    print(f"  Total rows: {existing_rows + new_rows}")
 
 
 if __name__ == "__main__":
