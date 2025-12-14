@@ -59,10 +59,21 @@ class Trainer:
         # Build optimizer with differential learning rates
         self.optimizer = self._build_optimizer(lr, backbone_lr)
         
-        # Scheduler: T_max = total_steps across all epochs
+        # Scheduler: Linear warm-up + Cosine decay
         steps_per_epoch = len(train_loader) if train_loader is not None else 1000
-        total_steps = steps_per_epoch * num_epochs
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps)
+        self.total_steps = steps_per_epoch * num_epochs
+        self.warmup_steps = min(1000, self.total_steps // 10)  # 1000 steps or 10% of training
+        
+        # Use cosine schedule after warmup
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, 
+            T_max=self.total_steps - self.warmup_steps
+        )
+        
+        # Store base LRs for warm-up calculation
+        self.base_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        
+        logging.info(f"Scheduler: {self.warmup_steps} warmup steps, then cosine decay")
         
         self.step = 0
     
@@ -238,8 +249,24 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.agent.parameters(), max_norm=1.0)
             
             self.optimizer.step()
-            self.scheduler.step()
+            
+            # Warmup LR schedule
+            if self.step < self.warmup_steps:
+                # Linear warmup: scale LR from 0 to base_lr
+                warmup_factor = (self.step + 1) / self.warmup_steps
+                for i, param_group in enumerate(self.optimizer.param_groups):
+                    param_group['lr'] = self.base_lrs[i] * warmup_factor
+            else:
+                # After warmup, use cosine schedule
+                self.scheduler.step()
+            
             self.step += 1
+            
+            # Debug: Log first batch predictions to verify output distribution
+            if self.step == 1:
+                pred_sample = pred_bbox[0, -1].detach().cpu().numpy()  # First sample, final step
+                gt_sample = gt_bbox[0].detach().cpu().numpy()
+                logging.info(f"[DEBUG] First batch - Pred: {pred_sample}, GT: {gt_sample}")
             
             # =============================================================
             # Logging
@@ -247,12 +274,15 @@ class Trainer:
             # Use Final Step for metrics
             final_iou = iou_flat.view(-1, Steps)[:, -1].mean()
             
+            # Get current LR (from first param group)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
             metrics = {
                 "train/loss": loss.item(),
                 "train/iou": final_iou.item(),
                 "train/l1": loss_l1.item(),
                 "train/giou_loss": loss_giou.item(),
-                "train/lr": self.scheduler.get_last_lr()[0]
+                "train/lr": current_lr
             }
             
             if self.use_act:
