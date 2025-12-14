@@ -33,7 +33,10 @@ def main():
     
     # Training arguments
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="Learning rate for TRM and heads")
+    parser.add_argument("--backbone_lr", type=float, default=None,
+                        help="Learning rate for vision backbone (default: lr/10 when unfreezing)")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "sample"], 
                         help="train or sample mode")
     
@@ -214,11 +217,18 @@ def main():
     # =========================================================================
     # 3. Setup Trainer
     # =========================================================================
+    # Determine backbone LR (use lr/10 by default when unfreezing)
+    backbone_lr = args.backbone_lr
+    if args.unfreeze_backbone and backbone_lr is None:
+        backbone_lr = args.lr / 10
+        logger.info(f"Using default backbone_lr={backbone_lr:.2e} (lr/10)")
+    
     trainer = Trainer(
         agent, 
         train_loader, 
         val_loader, 
         lr=args.lr, 
+        backbone_lr=backbone_lr,
         num_epochs=args.epochs, 
         use_wandb=args.use_wandb,
         act_loss_weight=args.act_loss_weight

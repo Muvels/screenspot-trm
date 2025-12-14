@@ -31,6 +31,7 @@ class Trainer:
     - Supervised Pretraining (Regression with deep supervision)
     - RL Fine-tuning (PPO-style or simple Policy Gradient)
     - ACT Loss (Q-learning based halting)
+    - Differential learning rates for backbone vs heads
     """
     
     def __init__(
@@ -39,6 +40,7 @@ class Trainer:
         train_loader: DataLoader, 
         val_loader: Optional[DataLoader] = None,
         lr: float = 1e-4,
+        backbone_lr: Optional[float] = None,
         num_epochs: int = 1,
         device: str = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
         use_wandb: bool = False,
@@ -54,7 +56,8 @@ class Trainer:
         # Check if ACT is enabled
         self.use_act = getattr(agent.core, 'use_act', False)
         
-        self.optimizer = optim.AdamW(self.agent.parameters(), lr=lr)
+        # Build optimizer with differential learning rates
+        self.optimizer = self._build_optimizer(lr, backbone_lr)
         
         # Scheduler: T_max = total_steps across all epochs
         steps_per_epoch = len(train_loader) if train_loader is not None else 1000
@@ -62,6 +65,51 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=total_steps)
         
         self.step = 0
+    
+    def _build_optimizer(self, lr: float, backbone_lr: Optional[float] = None) -> optim.Optimizer:
+        """
+        Build optimizer with optional differential learning rates.
+        
+        If backbone_lr is provided:
+        - Vision backbone (encoder.backbone): uses backbone_lr
+        - Everything else (TRM, heads, projections): uses lr
+        
+        If backbone_lr is None:
+        - All parameters use lr (single param group)
+        """
+        if backbone_lr is None:
+            # Simple case: all params same LR
+            return optim.AdamW(self.agent.parameters(), lr=lr)
+        
+        # Differential LR: separate backbone from the rest
+        backbone_params = []
+        head_params = []
+        
+        for name, param in self.agent.named_parameters():
+            if not param.requires_grad:
+                continue
+            
+            # Check if this is a backbone parameter
+            # encoder.backbone.* are the pretrained weights
+            # encoder.vis_proj/txt_proj are new projection layers (use higher lr)
+            if "encoder.backbone" in name:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+        
+        param_groups = [
+            {"params": backbone_params, "lr": backbone_lr, "name": "backbone"},
+            {"params": head_params, "lr": lr, "name": "heads"}
+        ]
+        
+        # Log parameter counts
+        n_backbone = sum(p.numel() for p in backbone_params)
+        n_heads = sum(p.numel() for p in head_params)
+        logging.info(f"Differential LR setup:")
+        logging.info(f"  - Backbone params: {n_backbone:,} @ lr={backbone_lr:.2e}")
+        logging.info(f"  - Head params: {n_heads:,} @ lr={lr:.2e}")
+        
+        return optim.AdamW(param_groups)
         
     def compute_act_loss(
         self, 
