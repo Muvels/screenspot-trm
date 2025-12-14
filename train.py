@@ -14,7 +14,7 @@ import logging
 from torch.utils.data import DataLoader
 from transformers import AutoProcessor
 
-from data_loader.screenspot import ScreenspotDataset
+from data_loader.screenspot import ScreenspotDataset, RowGroupBatchSampler
 from models.agent import InfoMaxAgent
 from training.trainer import Trainer
 
@@ -144,33 +144,72 @@ def main():
         logger.error(f"Dataset not found at {args.data_path}. Please check path.")
         return
 
-    # Limit dataset if max_samples is set
-    if args.max_samples and args.max_samples < len(dataset):
-        logger.info(f"Limiting dataset to {args.max_samples} samples for debugging.")
-        indices = torch.arange(args.max_samples)
-        dataset = torch.utils.data.Subset(dataset, indices)
-        
-    # Split
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Get row group offsets for efficient batch sampling
+    row_group_offsets = dataset.get_row_group_offsets()
+    num_row_groups = len(row_group_offsets)
     
-    train_loader = DataLoader(
-        train_ds, 
+    # Split by row groups (not individual samples) to maintain locality
+    # 90% train, 10% val
+    train_rg_count = int(0.9 * num_row_groups)
+    
+    # Shuffle row groups for split
+    import random
+    rg_indices = list(range(num_row_groups))
+    random.shuffle(rg_indices)
+    
+    train_rg_indices = set(rg_indices[:train_rg_count])
+    val_rg_indices = set(rg_indices[train_rg_count:])
+    
+    train_offsets = [row_group_offsets[i] for i in train_rg_indices]
+    val_offsets = [row_group_offsets[i] for i in val_rg_indices]
+    
+    train_samples = sum(num_rows for _, num_rows in train_offsets)
+    val_samples = sum(num_rows for _, num_rows in val_offsets)
+    
+    # Limit dataset if max_samples is set
+    if args.max_samples and args.max_samples < train_samples:
+        logger.info(f"Limiting to ~{args.max_samples} samples for debugging.")
+        # Limit by reducing row groups
+        limited_offsets = []
+        total = 0
+        for offset, num_rows in train_offsets:
+            if total >= args.max_samples:
+                break
+            limited_offsets.append((offset, num_rows))
+            total += num_rows
+        train_offsets = limited_offsets
+        train_samples = sum(num_rows for _, num_rows in train_offsets)
+    
+    logger.info(f"Dataset: {train_samples:,} train, {val_samples:,} val samples")
+    logger.info(f"Row groups: {len(train_offsets)} train, {len(val_offsets)} val")
+    
+    # Create batch samplers for efficient row group-aware loading
+    train_batch_sampler = RowGroupBatchSampler(
+        train_offsets, 
         batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=args.num_workers,
-        collate_fn=collate_fn
-    ) 
-    val_loader = DataLoader(
-        val_ds, 
+        shuffle=True
+    )
+    val_batch_sampler = RowGroupBatchSampler(
+        val_offsets, 
         batch_size=args.batch_size, 
-        shuffle=False, 
-        num_workers=args.num_workers,
-        collate_fn=collate_fn
+        shuffle=False
     )
     
-    logger.info(f"Dataset: {len(train_ds)} train, {len(val_ds)} val samples")
+    # DataLoaders with batch samplers (no shuffle - sampler handles it)
+    train_loader = DataLoader(
+        dataset,  # Use full dataset, sampler selects indices
+        batch_sampler=train_batch_sampler,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    ) 
+    val_loader = DataLoader(
+        dataset,
+        batch_sampler=val_batch_sampler,
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
     
     # =========================================================================
     # 2. Setup Agent
