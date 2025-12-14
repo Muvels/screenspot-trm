@@ -1,93 +1,176 @@
+"""
+Memory-Efficient Dataset Preprocessing
+
+Processes large parquet files in streaming chunks to avoid OOM.
+Tokenizes text and writes output incrementally.
+
+Usage:
+    python dataset_prep/preprocess.py \
+        --input_path ../merged_v2.parquet \
+        --output_path dataset/screenspot_tokenized.parquet \
+        --model_name google/siglip-base-patch16-256-multilingual \
+        --batch_size 10000
+"""
+
 import torch
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from transformers import AutoProcessor
 import argparse
 from tqdm import tqdm
-import pyarrow as pa
-import pyarrow.parquet as pq
 import logging
 import os
 
-def preprocess_dataset(input_path: str, output_path: str, model_name: str, batch_size: int = 1000):
+
+def extract_bytes(x):
+    """Extract bytes from image struct if needed."""
+    if isinstance(x, dict) and 'bytes' in x:
+        return x['bytes']
+    return x
+
+
+def preprocess_dataset_streaming(
+    input_path: str, 
+    output_path: str, 
+    model_name: str, 
+    batch_size: int = 10000
+):
     """
-    Loads the parquet dataset, tokenizes the 'task' column using CLIPProcessor,
-    and saves the new dataset with 'input_ids' and 'attention_mask' columns.
+    Processes a large parquet file in streaming chunks.
+    
+    Memory usage: ~8-16 GB regardless of file size.
+    
+    Args:
+        input_path: Path to input parquet file (can be 100s of GB)
+        output_path: Path to output parquet file
+        model_name: HuggingFace model name for tokenizer
+        batch_size: Rows to process at a time (higher = faster but more RAM)
     """
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
-
-    logger.info(f"Loading dataset from {input_path}...")
-    try:
-        df = pd.read_parquet(input_path)
-    except Exception as e:
-        logger.error(f"Failed to load dataset: {e}")
-        return
-
+    
     logger.info(f"Loading processor for {model_name}...")
     processor = AutoProcessor.from_pretrained(model_name)
     
-    # We will process in chunks to show progress
-    input_ids_list = []
-    attention_mask_list = []
+    logger.info(f"Opening {input_path} for streaming...")
+    parquet_file = pq.ParquetFile(input_path)
     
-    logger.info("Tokenizing text...")
+    # Get metadata
+    total_rows = parquet_file.metadata.num_rows
+    num_row_groups = parquet_file.metadata.num_row_groups
+    logger.info(f"Total rows: {total_rows:,}")
+    logger.info(f"Row groups: {num_row_groups}")
+    logger.info(f"Processing in batches of {batch_size:,}")
     
-    tasks = df['task'].fillna("").tolist() # Handle NaNs
+    # Get schema and add new columns
+    original_schema = parquet_file.schema_arrow
     
-    # Flatten image column to bytes to avoid PyArrow nested struct issues
-    logger.info("Flattening image struct to bytes...")
-    def extract_bytes(x):
-        if isinstance(x, dict) and 'bytes' in x:
-            return x['bytes']
-        return x
+    # Define new fields for tokenized data
+    new_fields = [
+        pa.field("input_ids", pa.list_(pa.int64())),
+        pa.field("attention_mask", pa.list_(pa.int64()))
+    ]
     
-    # Check if 'image' exists
-    if 'image' in df.columns:
-        df['image'] = df['image'].apply(extract_bytes)
-        # Rename to generic name or keep as image? 
-        # Keeping as 'image' but ensuring it's bytes.
-        # Verify it's bytes
-        # df['image'] = df['image'].astype(bytes)
-    
-    # Batch processing for speed
-    for i in tqdm(range(0, len(tasks), batch_size)):
-        batch_tasks = tasks[i : i + batch_size]
-        
-        # Tokenize (padding="max_length" to ensure consistent columns in parquet? 
-        # Actually standard parquet handles lists of varying length, but for ML training 
-        # we usually want fixed max_len or we pad in COLLATE_FN.
-        # However, CLIP expects max_length=77 usually.
-        encoded = processor(text=batch_tasks, return_tensors="np", padding="max_length", truncation=True, max_length=64) # SigLIP uses shorter context usually, keeping 64-77 is safe
-        
-        input_ids = encoded["input_ids"]
-        if "attention_mask" in encoded:
-            attn_mask = encoded["attention_mask"]
+    # Build new schema (original + new fields)
+    # First, check if image column needs to be converted to binary
+    new_schema_fields = []
+    for field in original_schema:
+        if field.name == "image":
+            # Convert image struct to binary
+            new_schema_fields.append(pa.field("image", pa.binary()))
         else:
-            # Generate mask: 1 for non-pad tokens, 0 for pad tokens
-            # We need to access the tokenizer's pad_token_id.
-            # Usually processor.tokenizer exists.
-            pad_id = processor.tokenizer.pad_token_id
-            if pad_id is None:
-                 pad_id = 0 # Fallback
-            attn_mask = (input_ids != pad_id).astype("int64")
-
-        input_ids_list.extend(input_ids.tolist())
-        attention_mask_list.extend(attn_mask.tolist())
-        
-    # Add columns
-    logger.info("Adding new columns to dataframe...")
-    df["input_ids"] = input_ids_list
-    df["attention_mask"] = attention_mask_list
+            new_schema_fields.append(field)
+    new_schema_fields.extend(new_fields)
+    new_schema = pa.schema(new_schema_fields)
     
-    logger.info(f"Saving to {output_path}...")
-    df.to_parquet(output_path)
-    logger.info("Done!")
+    # Open writer
+    writer = pq.ParquetWriter(output_path, new_schema, compression='snappy')
+    
+    # Progress bar
+    pbar = tqdm(total=total_rows, desc="Processing", unit="rows")
+    
+    try:
+        # Iterate through batches
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            # Convert to pandas for easier manipulation
+            df_batch = batch.to_pandas()
+            batch_len = len(df_batch)
+            
+            # Extract image bytes if needed
+            if 'image' in df_batch.columns:
+                df_batch['image'] = df_batch['image'].apply(extract_bytes)
+            
+            # Get tasks and tokenize
+            tasks = df_batch['task'].fillna("").tolist()
+            
+            encoded = processor(
+                text=tasks, 
+                return_tensors="np", 
+                padding="max_length", 
+                truncation=True, 
+                max_length=64
+            )
+            
+            input_ids = encoded["input_ids"]
+            if "attention_mask" in encoded:
+                attn_mask = encoded["attention_mask"]
+            else:
+                # Generate mask for models that don't return it
+                pad_id = getattr(processor.tokenizer, 'pad_token_id', 0) or 0
+                attn_mask = (input_ids != pad_id).astype("int64")
+            
+            # Add new columns
+            df_batch["input_ids"] = input_ids.tolist()
+            df_batch["attention_mask"] = attn_mask.tolist()
+            
+            # Convert back to PyArrow table and write
+            table_batch = pa.Table.from_pandas(df_batch, schema=new_schema, preserve_index=False)
+            writer.write_table(table_batch)
+            
+            pbar.update(batch_len)
+            
+    except Exception as e:
+        logger.error(f"Error processing batch: {e}")
+        raise
+    finally:
+        writer.close()
+        pbar.close()
+    
+    # Log output file size
+    output_size = os.path.getsize(output_path) / (1024**3)
+    logger.info(f"Done! Output file: {output_path} ({output_size:.2f} GB)")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_path", type=str, default="dataset/screenspot_training.parquet")
-    parser.add_argument("--output_path", type=str, default="dataset/screenspot_tokenized.parquet")
-    parser.add_argument("--model_name", type=str, default="openai/clip-vit-base-patch32")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pre-tokenize dataset with streaming (memory-efficient)"
+    )
+    parser.add_argument(
+        "--input_path", type=str, required=True,
+        help="Path to input parquet file"
+    )
+    parser.add_argument(
+        "--output_path", type=str, required=True,
+        help="Path to output parquet file"
+    )
+    parser.add_argument(
+        "--model_name", type=str, 
+        default="google/siglip-base-patch16-256-multilingual",
+        help="HuggingFace model name for tokenizer"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=10000,
+        help="Rows to process at a time (default: 10000)"
+    )
     args = parser.parse_args()
     
-    preprocess_dataset(args.input_path, args.output_path, args.model_name)
+    preprocess_dataset_streaming(
+        args.input_path, 
+        args.output_path, 
+        args.model_name,
+        args.batch_size
+    )
+
+
+if __name__ == "__main__":
+    main()
