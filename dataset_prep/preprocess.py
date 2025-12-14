@@ -21,6 +21,7 @@ import argparse
 from tqdm import tqdm
 import logging
 import os
+import gc
 
 
 def extract_bytes(x):
@@ -201,8 +202,13 @@ def preprocess_dataset_streaming(
             rows_processed += batch_len
             pbar.update(batch_len)
             
-            # Free memory
+            # Free memory explicitly
             del df_batch, table, table_batch
+            del input_ids_list, attention_mask_list, tasks
+            
+            # Force garbage collection every 10 row groups to prevent slowdown
+            if rg_idx % 10 == 0:
+                gc.collect()
             
     except KeyboardInterrupt:
         logger.warning(f"Interrupted! Resume with --resume_from_rg {rg_idx}")
